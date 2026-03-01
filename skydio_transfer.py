@@ -11,7 +11,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 
@@ -63,18 +62,13 @@ class SkydioAPI:
             h["X-Api-Token-Id"] = self.token_id
         return h
 
-    def get_flights(self, date_from=None, date_to=None):
-        """Fetch all flights, optionally filtered by date range. Handles pagination."""
+    def get_flights(self):
+        """Fetch all flights. Handles pagination."""
         all_flights = []
         page = 1
 
         while True:
             params = {"per_page": 100, "page_number": page}
-            if date_from:
-                params["takeoff_after"] = f"{date_from}T00:00:00Z"
-            if date_to:
-                params["takeoff_before"] = f"{date_to}T23:59:59Z"
-
             resp = requests.get(
                 f"{BASE_URL}/flights", headers=self._headers(), params=params, timeout=30
             )
@@ -149,21 +143,14 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} TB"
 
 
-def flight_date(flight):
-    """Extract date string (YYYY-MM-DD) from a flight's takeoff timestamp."""
+def parse_takeoff(flight):
+    """Extract (date_str, time_str) from a flight's takeoff timestamp."""
     takeoff = flight.get("takeoff", "")
-    if takeoff:
-        return takeoff[:10]
-    return "unknown"
-
-
-def flight_display(flight):
-    """Build a human-readable display string for a flight."""
-    date = flight_date(flight)
-    fid = flight.get("flight_id", "???")[:8]
-    vehicle = flight.get("vehicle_serial", "—")
-    media_count = flight.get("media_count", "?")
-    return f"{date}  |  Flight {fid}  |  Vehicle {vehicle}  |  {media_count} files"
+    if takeoff and len(takeoff) >= 16:
+        return takeoff[:10], takeoff[11:16]  # YYYY-MM-DD, HH:MM
+    if takeoff and len(takeoff) >= 10:
+        return takeoff[:10], "—"
+    return "unknown", "—"
 
 
 # ──────────────────────────────────────────────
@@ -174,13 +161,14 @@ class SkydioTransferApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Skydio Media Transfer")
-        self.root.geometry("720x680")
-        self.root.minsize(600, 550)
+        self.root.geometry("800x720")
+        self.root.minsize(650, 580)
         self.root.resizable(True, True)
 
-        self.flights = []
-        self.flight_vars = []  # list of (BooleanVar, flight_dict)
-        self.api = None
+        # Data stores
+        self.all_media = []       # list of dicts with enriched media info
+        self.displayed_ids = []   # Treeview item IDs currently shown
+        self.available_dates = [] # sorted unique date strings
         self.downloading = False
 
         self._build_ui()
@@ -215,62 +203,67 @@ class SkydioTransferApp:
 
         settings_frame.columnconfigure(1, weight=1)
 
-        # --- Flights Frame ---
-        flights_frame = ttk.LabelFrame(self.root, text="Flights", padding=10)
-        flights_frame.pack(fill=tk.BOTH, expand=True, **pad)
+        # --- Filter Frame ---
+        filter_frame = ttk.LabelFrame(self.root, text="Filter & Fetch", padding=10)
+        filter_frame.pack(fill=tk.X, **pad)
 
-        filter_row = ttk.Frame(flights_frame)
+        filter_row = ttk.Frame(filter_frame)
         filter_row.pack(fill=tk.X)
 
         ttk.Label(filter_row, text="Date From:").pack(side=tk.LEFT)
-        self.date_from_entry = ttk.Entry(filter_row, width=12)
-        self.date_from_entry.pack(side=tk.LEFT, padx=(4, 12))
-        self.date_from_entry.insert(0, "YYYY-MM-DD")
-        self.date_from_entry.bind("<FocusIn>", lambda e: self._clear_placeholder(e, "YYYY-MM-DD"))
+        self.date_from_combo = ttk.Combobox(filter_row, width=14, state="readonly")
+        self.date_from_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self.date_from_combo.set("All")
+        self.date_from_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_date_filter())
 
         ttk.Label(filter_row, text="Date To:").pack(side=tk.LEFT)
-        self.date_to_entry = ttk.Entry(filter_row, width=12)
-        self.date_to_entry.pack(side=tk.LEFT, padx=(4, 12))
-        self.date_to_entry.insert(0, "YYYY-MM-DD")
-        self.date_to_entry.bind("<FocusIn>", lambda e: self._clear_placeholder(e, "YYYY-MM-DD"))
+        self.date_to_combo = ttk.Combobox(filter_row, width=14, state="readonly")
+        self.date_to_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self.date_to_combo.set("All")
+        self.date_to_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_date_filter())
 
-        ttk.Button(filter_row, text="Fetch Flights", command=self._fetch_flights).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
+        self.fetch_btn = ttk.Button(filter_row, text="Fetch Media", command=self._fetch_all)
+        self.fetch_btn.pack(side=tk.LEFT, padx=(8, 0))
 
-        # Scrollable flight list
-        list_container = ttk.Frame(flights_frame)
-        list_container.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        # --- Media List Frame ---
+        media_frame = ttk.LabelFrame(self.root, text="Media Files", padding=10)
+        media_frame.pack(fill=tk.BOTH, expand=True, **pad)
 
-        self.flight_canvas = tk.Canvas(list_container, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.flight_canvas.yview)
-        self.flight_list_frame = ttk.Frame(self.flight_canvas)
+        # Treeview with columns
+        columns = ("filename", "date", "time", "type", "size")
+        self.tree = ttk.Treeview(media_frame, columns=columns, show="headings", selectmode="extended")
 
-        self.flight_list_frame.bind(
-            "<Configure>",
-            lambda e: self.flight_canvas.configure(scrollregion=self.flight_canvas.bbox("all")),
-        )
-        self.flight_canvas.create_window((0, 0), window=self.flight_list_frame, anchor=tk.NW)
-        self.flight_canvas.configure(yscrollcommand=scrollbar.set)
+        self.tree.heading("filename", text="Filename", command=lambda: self._sort_column("filename"))
+        self.tree.heading("date", text="Date", command=lambda: self._sort_column("date"))
+        self.tree.heading("time", text="Time", command=lambda: self._sort_column("time"))
+        self.tree.heading("type", text="Type", command=lambda: self._sort_column("type"))
+        self.tree.heading("size", text="Size", command=lambda: self._sort_column("size"))
 
-        self.flight_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.column("filename", width=260, minwidth=120)
+        self.tree.column("date", width=100, minwidth=80)
+        self.tree.column("time", width=60, minwidth=50)
+        self.tree.column("type", width=70, minwidth=50)
+        self.tree.column("size", width=80, minwidth=60, anchor=tk.E)
 
-        # Bind mousewheel scrolling
-        self.flight_canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: self.flight_canvas.yview_scroll(-1 * (e.delta // 120), "units"),
-        )
+        tree_scroll = ttk.Scrollbar(media_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._sort_reverse = {}  # track sort direction per column
 
         # Select / Deselect buttons
-        btn_row = ttk.Frame(flights_frame)
-        btn_row.pack(fill=tk.X, pady=(4, 0))
+        btn_row = ttk.Frame(media_frame)
+        # Place below treeview by re-packing — actually put outside
+        media_frame_bottom = ttk.Frame(self.root)
+        media_frame_bottom.pack(fill=tk.X, padx=8)
 
-        ttk.Button(btn_row, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(btn_row, text="Deselect All", command=self._deselect_all).pack(side=tk.LEFT)
+        ttk.Button(media_frame_bottom, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(media_frame_bottom, text="Deselect All", command=self._deselect_all).pack(side=tk.LEFT)
 
-        self.flight_count_label = ttk.Label(btn_row, text="")
-        self.flight_count_label.pack(side=tk.RIGHT)
+        self.media_count_label = ttk.Label(media_frame_bottom, text="")
+        self.media_count_label.pack(side=tk.RIGHT)
 
         # --- Download Frame ---
         dl_frame = ttk.LabelFrame(self.root, text="Download", padding=10)
@@ -292,13 +285,6 @@ class SkydioTransferApp:
 
         self.status_label = ttk.Label(dl_frame, text="Ready.", anchor=tk.W)
         self.status_label.pack(fill=tk.X)
-
-    # ── Placeholder Handling ──
-
-    def _clear_placeholder(self, event, placeholder):
-        widget = event.widget
-        if widget.get() == placeholder:
-            widget.delete(0, tk.END)
 
     # ── Token Visibility ──
 
@@ -334,27 +320,62 @@ class SkydioTransferApp:
             return None
         return SkydioAPI(token, token_id)
 
-    # ── Fetch Flights ──
+    # ── Fetch All Flights + Media ──
 
-    def _fetch_flights(self):
+    def _fetch_all(self):
         api = self._get_api()
         if not api:
             return
 
-        date_from = self.date_from_entry.get().strip()
-        date_to = self.date_to_entry.get().strip()
-        if date_from == "YYYY-MM-DD":
-            date_from = None
-        if date_to == "YYYY-MM-DD":
-            date_to = None
-
         self._set_status("Fetching flights...")
+        self.fetch_btn.config(state=tk.DISABLED)
         self.download_btn.config(state=tk.DISABLED)
 
         def worker():
             try:
-                flights = api.get_flights(date_from, date_to)
-                self.root.after(0, lambda: self._populate_flights(flights))
+                # Step 1: Fetch all flights
+                flights = api.get_flights()
+                total = len(flights)
+                self._set_status_safe(f"Found {total} flights. Loading media...")
+
+                # Step 2: Fetch media for each flight
+                enriched_media = []
+                for i, flight in enumerate(flights, 1):
+                    flight_id = flight.get("flight_id", "")
+                    date_str, time_str = parse_takeoff(flight)
+                    vehicle = flight.get("vehicle_serial", "—")
+
+                    self._set_status_safe(f"Loading media for flight {i}/{total}...")
+
+                    try:
+                        media_files = api.get_flight_media(flight_id)
+                    except Exception:
+                        media_files = []
+
+                    for mf in media_files:
+                        # Use the media's own captured_time if available, fall back to flight takeoff
+                        cap_time = mf.get("captured_time", "")
+                        if cap_time and len(cap_time) >= 16:
+                            m_date = cap_time[:10]
+                            m_time = cap_time[11:16]
+                        else:
+                            m_date = date_str
+                            m_time = time_str
+
+                        enriched_media.append({
+                            "uuid": mf.get("uuid", ""),
+                            "filename": mf.get("filename", f"media_{mf.get('uuid', '?')}"),
+                            "date": m_date,
+                            "time": m_time,
+                            "kind": mf.get("kind", "—"),
+                            "size": mf.get("size", 0),
+                            "size_display": format_size(mf.get("size", 0)),
+                            "flight_id": flight_id,
+                            "vehicle": vehicle,
+                        })
+
+                self.root.after(0, lambda: self._populate_media(enriched_media))
+
             except requests.exceptions.HTTPError as e:
                 err = e
                 self.root.after(0, lambda: self._handle_api_error(err))
@@ -362,33 +383,72 @@ class SkydioTransferApp:
                 msg = str(e)
                 self.root.after(0, lambda: messagebox.showerror("Error", msg))
             finally:
+                self.root.after(0, lambda: self.fetch_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _populate_flights(self, flights):
-        # Clear existing
-        for widget in self.flight_list_frame.winfo_children():
-            widget.destroy()
-        self.flight_vars.clear()
-        self.flights = flights
+    def _populate_media(self, media_list):
+        """Populate the treeview and date dropdowns with fetched media."""
+        self.all_media = media_list
 
-        if not flights:
-            ttk.Label(self.flight_list_frame, text="No flights found.").pack(anchor=tk.W)
-            self.flight_count_label.config(text="0 flights")
-            self._set_status("No flights found.")
-            return
+        # Build sorted unique dates for the dropdowns
+        dates = sorted(set(m["date"] for m in media_list if m["date"] != "unknown"))
+        self.available_dates = dates
 
-        for flight in flights:
-            var = tk.BooleanVar(value=False)
-            cb = ttk.Checkbutton(
-                self.flight_list_frame, text=flight_display(flight), variable=var
-            )
-            cb.pack(anchor=tk.W, pady=1)
-            self.flight_vars.append((var, flight))
+        date_options = ["All"] + dates
+        self.date_from_combo["values"] = date_options
+        self.date_to_combo["values"] = date_options
+        self.date_from_combo.set("All")
+        self.date_to_combo.set("All")
 
-        self.flight_count_label.config(text=f"{len(flights)} flights")
-        self._set_status(f"Loaded {len(flights)} flights.")
+        # Show all media
+        self._refresh_tree(media_list)
+        self._set_status(f"Loaded {len(media_list)} media files from {len(self.available_dates)} flight dates.")
+
+    def _apply_date_filter(self):
+        """Filter the displayed media based on the date dropdown selections."""
+        date_from = self.date_from_combo.get()
+        date_to = self.date_to_combo.get()
+
+        filtered = self.all_media
+        if date_from != "All":
+            filtered = [m for m in filtered if m["date"] >= date_from]
+        if date_to != "All":
+            filtered = [m for m in filtered if m["date"] <= date_to]
+
+        self._refresh_tree(filtered)
+
+    def _refresh_tree(self, media_list):
+        """Clear and repopulate the Treeview."""
+        self.tree.delete(*self.tree.get_children())
+
+        for m in media_list:
+            self.tree.insert("", tk.END, iid=m["uuid"], values=(
+                m["filename"],
+                m["date"],
+                m["time"],
+                m["kind"],
+                m["size_display"],
+            ))
+
+        count = len(media_list)
+        self.media_count_label.config(text=f"{count} files")
+
+    # ── Column Sorting ──
+
+    def _sort_column(self, col):
+        """Sort treeview by clicking column headers."""
+        reverse = self._sort_reverse.get(col, False)
+        self._sort_reverse[col] = not reverse
+
+        items = [(self.tree.set(iid, col), iid) for iid in self.tree.get_children("")]
+        items.sort(key=lambda x: x[0].lower(), reverse=reverse)
+
+        for index, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", index)
+
+    # ── API Error Handler ──
 
     def _handle_api_error(self, error):
         resp = getattr(error, "response", None)
@@ -401,17 +461,16 @@ class SkydioTransferApp:
             messagebox.showwarning("Rate Limited", f"Too many requests. Try again in {retry} seconds.")
         else:
             messagebox.showerror("API Error", str(error))
-        self._set_status("Error fetching flights.")
+        self._set_status("Error.")
 
     # ── Select / Deselect ──
 
     def _select_all(self):
-        for var, _ in self.flight_vars:
-            var.set(True)
+        children = self.tree.get_children()
+        self.tree.selection_set(children)
 
     def _deselect_all(self):
-        for var, _ in self.flight_vars:
-            var.set(False)
+        self.tree.selection_remove(*self.tree.get_children())
 
     # ── Folder Picker ──
 
@@ -427,9 +486,9 @@ class SkydioTransferApp:
         if self.downloading:
             return
 
-        selected = [(var, flight) for var, flight in self.flight_vars if var.get()]
-        if not selected:
-            messagebox.showinfo("Nothing Selected", "Select at least one flight to download.")
+        selected_ids = self.tree.selection()
+        if not selected_ids:
+            messagebox.showinfo("Nothing Selected", "Select at least one file to download.\n\nTip: Click a row to select, Ctrl+click for multiple, or use Select All.")
             return
 
         output_folder = self.output_entry.get().strip()
@@ -446,54 +505,42 @@ class SkydioTransferApp:
         cfg["output_folder"] = output_folder
         save_config(cfg)
 
+        # Build download list from selected tree items
+        media_by_uuid = {m["uuid"]: m for m in self.all_media}
+        to_download = [media_by_uuid[uid] for uid in selected_ids if uid in media_by_uuid]
+
+        if not to_download:
+            return
+
         self.downloading = True
         self.download_btn.config(state=tk.DISABLED)
+        self.fetch_btn.config(state=tk.DISABLED)
         self.progress_bar["value"] = 0
-
-        flights_to_download = [flight for _, flight in selected]
 
         def worker():
             try:
-                self._download_flights(api, flights_to_download, output_folder)
+                self._download_media(api, to_download, output_folder)
             except Exception as e:
                 msg = str(e)
                 self.root.after(0, lambda: messagebox.showerror("Download Error", msg))
             finally:
                 self.downloading = False
                 self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.fetch_btn.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _download_flights(self, api, flights, output_folder):
-        # First, gather all media files across selected flights
-        all_media = []  # list of (date_str, file_dict)
-        total_flights = len(flights)
-
-        for i, flight in enumerate(flights, 1):
-            self._set_status_safe(f"Fetching media for flight {i}/{total_flights}...")
-            flight_id = flight.get("flight_id", "")
-            date_str = flight_date(flight)
-
-            try:
-                media_files = api.get_flight_media(flight_id)
-                for mf in media_files:
-                    all_media.append((date_str, mf))
-            except Exception as e:
-                self._set_status_safe(f"Error fetching media for flight {flight_id[:8]}: {e}")
-
-        if not all_media:
-            self._set_status_safe("No media files found in selected flights.")
-            return
-
-        total_files = len(all_media)
+    def _download_media(self, api, media_list, output_folder):
+        total_files = len(media_list)
         completed = 0
         skipped = 0
         errors = 0
 
-        for date_str, media_file in all_media:
-            file_uuid = media_file.get("uuid", "")
-            filename = media_file.get("filename", f"media_{file_uuid}")
-            file_size = media_file.get("size", 0)
+        for media in media_list:
+            file_uuid = media["uuid"]
+            filename = media["filename"]
+            file_size = media["size"]
+            date_str = media["date"]
 
             # Create date subfolder
             date_folder = Path(output_folder) / date_str
@@ -509,16 +556,17 @@ class SkydioTransferApp:
                     self._update_progress_safe(completed, total_files, f"Skipped {filename} (exists)")
                     continue
 
-            self._set_status_safe(
-                f"Downloading {filename} ({completed + 1}/{total_files})..."
-            )
+            self._set_status_safe(f"Downloading {filename} ({completed + 1}/{total_files})...")
 
             try:
-                def file_progress(downloaded, total):
+                # Capture current values for the closure
+                _filename = filename
+                _completed = completed
+                _total = total_files
+
+                def file_progress(downloaded, total, fn=_filename, comp=_completed, tot=_total):
                     pct = downloaded / total * 100 if total else 0
-                    self._set_status_safe(
-                        f"Downloading {filename} ({completed + 1}/{total_files}) — {pct:.0f}%"
-                    )
+                    self._set_status_safe(f"Downloading {fn} ({comp + 1}/{tot}) — {pct:.0f}%")
 
                 api.download_file(file_uuid, str(dest_path), progress_callback=file_progress)
                 completed += 1
