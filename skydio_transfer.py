@@ -63,42 +63,22 @@ class SkydioAPI:
             h["X-Api-Token-Id"] = self.token_id
         return h
 
-    def get_flights(self, date_from=None, date_to=None):
-        """Fetch flights, optionally filtered by date range. Handles pagination."""
-        all_flights = []
-        page = 1
+    def get_media(self, date_from=None, date_to=None, progress_callback=None):
+        """Fetch media files directly, filtered by date range. Handles pagination.
 
-        while True:
-            params = {"per_page": 100, "page_number": page}
-            if date_from:
-                params["takeoff_after"] = f"{date_from}T00:00:00Z"
-            if date_to:
-                params["takeoff_before"] = f"{date_to}T23:59:59Z"
-            resp = requests.get(
-                f"{BASE_URL}/flights", headers=self._headers(), params=params, timeout=30
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            flights = data.get("flights", [])
-            pagination = data.get("pagination", {})
-
-            all_flights.extend(flights)
-
-            current = pagination.get("current_page", page)
-            total = pagination.get("total_pages", 1)
-            if current >= total:
-                break
-            page += 1
-
-        return all_flights
-
-    def get_flight_media(self, flight_id):
-        """Fetch all media files for a given flight. Handles pagination."""
+        Uses /media_files endpoint with captured_since / captured_before params.
+        This is far more efficient than fetching flights first.
+        """
         all_files = []
         page = 1
 
         while True:
-            params = {"flight_id": flight_id, "per_page": 500, "page_number": page}
+            params = {"per_page": 500, "page_number": page}
+            if date_from:
+                params["captured_since"] = f"{date_from}T00:00:00Z"
+            if date_to:
+                params["captured_before"] = f"{date_to}T23:59:59Z"
+
             resp = requests.get(
                 f"{BASE_URL}/media_files", headers=self._headers(), params=params, timeout=30
             )
@@ -110,17 +90,24 @@ class SkydioAPI:
             all_files.extend(files)
 
             current = pagination.get("current_page", page)
-            total = pagination.get("total_pages", 1)
-            if current >= total:
+            total_pages = pagination.get("total_pages", 1)
+
+            if progress_callback:
+                progress_callback(current, total_pages, len(all_files))
+
+            if current >= total_pages:
                 break
             page += 1
 
         return all_files
 
-    def download_file(self, file_uuid, dest_path, progress_callback=None):
-        """Download a single media file by UUID to dest_path."""
-        url = f"{BASE_URL}/media/download/{file_uuid}"
-        resp = requests.get(url, headers=self._headers(), stream=True, timeout=120)
+    def download_file(self, download_url, dest_path, progress_callback=None):
+        """Download a media file using its direct download URL."""
+        # Use the direct download_url from the media response.
+        # Fall back to the old /media/download/{uuid} endpoint if needed.
+        resp = requests.get(
+            download_url, headers=self._headers(), stream=True, timeout=120
+        )
         resp.raise_for_status()
 
         total = int(resp.headers.get("content-length", 0))
@@ -132,6 +119,11 @@ class SkydioAPI:
                 downloaded += len(chunk)
                 if progress_callback and total > 0:
                     progress_callback(downloaded, total)
+
+    def download_file_by_uuid(self, file_uuid, dest_path, progress_callback=None):
+        """Download a media file by UUID (fallback method)."""
+        url = f"{BASE_URL}/media/download/{file_uuid}"
+        self.download_file(url, dest_path, progress_callback)
 
 
 # ──────────────────────────────────────────────
@@ -146,16 +138,6 @@ def format_size(size_bytes):
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
-
-
-def parse_takeoff(flight):
-    """Extract (date_str, time_str) from a flight's takeoff timestamp."""
-    takeoff = flight.get("takeoff", "")
-    if takeoff and len(takeoff) >= 16:
-        return takeoff[:10], takeoff[11:16]  # YYYY-MM-DD, HH:MM
-    if takeoff and len(takeoff) >= 10:
-        return takeoff[:10], "—"
-    return "unknown", "—"
 
 
 # ──────────────────────────────────────────────
@@ -396,9 +378,9 @@ class SkydioTransferApp:
         self.root.resizable(True, True)
 
         # Data stores
-        self.all_media = []       # list of dicts with enriched media info
-        self.available_dates = [] # sorted unique date strings
+        self.all_media = []       # list of dicts with media info
         self.downloading = False
+        self.cancel_requested = False
 
         self._build_ui()
         self._load_saved_config()
@@ -440,13 +422,11 @@ class SkydioTransferApp:
         filter_row.pack(fill=tk.X)
 
         ttk.Label(filter_row, text="Date From:").pack(side=tk.LEFT)
-        self.date_from = DateEntry(filter_row, placeholder="All dates",
-                                   on_change=self._apply_date_filter)
+        self.date_from = DateEntry(filter_row, placeholder="All dates")
         self.date_from.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Label(filter_row, text="Date To:").pack(side=tk.LEFT)
-        self.date_to = DateEntry(filter_row, placeholder="All dates",
-                                 on_change=self._apply_date_filter)
+        self.date_to = DateEntry(filter_row, placeholder="All dates")
         self.date_to.pack(side=tk.LEFT, padx=(4, 12))
 
         self.fetch_btn = ttk.Button(filter_row, text="Fetch Media", command=self._fetch_all)
@@ -502,8 +482,14 @@ class SkydioTransferApp:
         self.output_entry.pack(side=tk.LEFT, padx=(4, 4), fill=tk.X, expand=True)
         ttk.Button(folder_row, text="Browse", command=self._browse_folder).pack(side=tk.LEFT)
 
-        self.download_btn = ttk.Button(dl_frame, text="Download Selected", command=self._start_download)
-        self.download_btn.pack(fill=tk.X, pady=(8, 4))
+        btn_row = ttk.Frame(dl_frame)
+        btn_row.pack(fill=tk.X, pady=(8, 4))
+
+        self.download_btn = ttk.Button(btn_row, text="Download Selected", command=self._start_download)
+        self.download_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._cancel_download, state=tk.DISABLED)
+        self.cancel_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self.progress_bar = ttk.Progressbar(dl_frame, mode="determinate")
         self.progress_bar.pack(fill=tk.X, pady=(0, 4))
@@ -545,7 +531,7 @@ class SkydioTransferApp:
             return None
         return SkydioAPI(token, token_id)
 
-    # ── Fetch All Flights + Media ──
+    # ── Fetch Media Directly ──
 
     def _fetch_all(self):
         api = self._get_api()
@@ -574,68 +560,58 @@ class SkydioTransferApp:
         if not date_from and not date_to:
             if not messagebox.askyesno(
                 "No Date Filter",
-                "No date range is set. This will fetch ALL flights and media,\n"
-                "which can take a long time with many flights.\n\n"
+                "No date range is set. This will fetch ALL media files,\n"
+                "which can take a while with many files.\n\n"
                 "Set a date range first to speed things up.\n\n"
                 "Continue anyway?"
             ):
                 return
 
-        self._set_status("Fetching flights...")
+        self._set_status("Fetching media files...")
         self.fetch_btn.config(state=tk.DISABLED)
         self.download_btn.config(state=tk.DISABLED)
 
         def worker():
             try:
-                # Step 1: Fetch flights (filtered by date at the API level)
-                flights = api.get_flights(date_from=date_from, date_to=date_to)
-                total = len(flights)
-                range_desc = ""
-                if date_from and date_to:
-                    range_desc = f" ({date_from} to {date_to})"
-                elif date_from:
-                    range_desc = f" (from {date_from})"
-                elif date_to:
-                    range_desc = f" (through {date_to})"
-                self._set_status_safe(f"Found {total} flights{range_desc}. Loading media...")
+                def on_page(current_page, total_pages, files_so_far):
+                    self._set_status_safe(
+                        f"Fetching media... page {current_page}/{total_pages} "
+                        f"({files_so_far} files loaded)"
+                    )
 
-                # Step 2: Fetch media for each flight
-                enriched_media = []
-                for i, flight in enumerate(flights, 1):
-                    flight_id = flight.get("flight_id", "")
-                    date_str, time_str = parse_takeoff(flight)
-                    vehicle = flight.get("vehicle_serial", "—")
+                media_files = api.get_media(
+                    date_from=date_from,
+                    date_to=date_to,
+                    progress_callback=on_page,
+                )
 
-                    self._set_status_safe(f"Loading media for flight {i}/{total}...")
+                # Enrich media data for display
+                enriched = []
+                for mf in media_files:
+                    cap_time = mf.get("captured_time", "")
+                    if cap_time and len(cap_time) >= 16:
+                        m_date = cap_time[:10]
+                        m_time = cap_time[11:16]
+                    elif cap_time and len(cap_time) >= 10:
+                        m_date = cap_time[:10]
+                        m_time = "—"
+                    else:
+                        m_date = "unknown"
+                        m_time = "—"
 
-                    try:
-                        media_files = api.get_flight_media(flight_id)
-                    except Exception:
-                        media_files = []
+                    enriched.append({
+                        "uuid": mf.get("uuid", ""),
+                        "filename": mf.get("filename", f"media_{mf.get('uuid', '?')}"),
+                        "date": m_date,
+                        "time": m_time,
+                        "kind": mf.get("kind", "—"),
+                        "size": mf.get("size", 0),
+                        "size_display": format_size(mf.get("size", 0)),
+                        "download_url": mf.get("download_url", ""),
+                        "flight_id": mf.get("flight_id", ""),
+                    })
 
-                    for mf in media_files:
-                        # Use the media's own captured_time if available, fall back to flight takeoff
-                        cap_time = mf.get("captured_time", "")
-                        if cap_time and len(cap_time) >= 16:
-                            m_date = cap_time[:10]
-                            m_time = cap_time[11:16]
-                        else:
-                            m_date = date_str
-                            m_time = time_str
-
-                        enriched_media.append({
-                            "uuid": mf.get("uuid", ""),
-                            "filename": mf.get("filename", f"media_{mf.get('uuid', '?')}"),
-                            "date": m_date,
-                            "time": m_time,
-                            "kind": mf.get("kind", "—"),
-                            "size": mf.get("size", 0),
-                            "size_display": format_size(mf.get("size", 0)),
-                            "flight_id": flight_id,
-                            "vehicle": vehicle,
-                        })
-
-                self.root.after(0, lambda: self._populate_media(enriched_media))
+                self.root.after(0, lambda: self._populate_media(enriched))
 
             except requests.exceptions.HTTPError as e:
                 err = e
@@ -652,38 +628,9 @@ class SkydioTransferApp:
     def _populate_media(self, media_list):
         """Populate the treeview with fetched media."""
         self.all_media = media_list
-
-        # Show all media (date filter will apply if user has typed dates)
-        self._apply_date_filter()
+        self._refresh_tree(media_list)
         dates_count = len(set(m["date"] for m in media_list if m["date"] != "unknown"))
-        self._set_status(f"Loaded {len(media_list)} media files from {dates_count} flight dates.")
-
-    def _apply_date_filter(self):
-        """Filter the displayed media based on the date entry values."""
-        if not self.all_media:
-            return
-
-        date_from = self.date_from.get()
-        date_to = self.date_to.get()
-
-        filtered = self.all_media
-
-        if date_from:
-            # Validate format
-            try:
-                date_type.fromisoformat(date_from)
-                filtered = [m for m in filtered if m["date"] >= date_from]
-            except ValueError:
-                pass  # ignore invalid partial typing
-
-        if date_to:
-            try:
-                date_type.fromisoformat(date_to)
-                filtered = [m for m in filtered if m["date"] <= date_to]
-            except ValueError:
-                pass
-
-        self._refresh_tree(filtered)
+        self._set_status(f"Loaded {len(media_list)} media files across {dates_count} dates.")
 
     def _refresh_tree(self, media_list):
         """Clear and repopulate the Treeview."""
@@ -748,6 +695,10 @@ class SkydioTransferApp:
 
     # ── Download ──
 
+    def _cancel_download(self):
+        self.cancel_requested = True
+        self._set_status("Cancelling...")
+
     def _start_download(self):
         if self.downloading:
             return
@@ -779,8 +730,10 @@ class SkydioTransferApp:
             return
 
         self.downloading = True
+        self.cancel_requested = False
         self.download_btn.config(state=tk.DISABLED)
         self.fetch_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
         self.progress_bar["value"] = 0
 
         def worker():
@@ -791,8 +744,10 @@ class SkydioTransferApp:
                 self.root.after(0, lambda: messagebox.showerror("Download Error", msg))
             finally:
                 self.downloading = False
+                self.cancel_requested = False
                 self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.fetch_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -803,10 +758,18 @@ class SkydioTransferApp:
         errors = 0
 
         for media in media_list:
+            if self.cancel_requested:
+                self._set_status_safe(
+                    f"Cancelled. {completed - skipped - errors} downloaded, "
+                    f"{skipped} skipped, {errors} errors."
+                )
+                return
+
             file_uuid = media["uuid"]
             filename = media["filename"]
             file_size = media["size"]
             date_str = media["date"]
+            download_url = media.get("download_url", "")
 
             # Create date subfolder
             date_folder = Path(output_folder) / date_str
@@ -834,7 +797,12 @@ class SkydioTransferApp:
                     pct = downloaded / total * 100 if total else 0
                     self._set_status_safe(f"Downloading {fn} ({comp + 1}/{tot}) — {pct:.0f}%")
 
-                api.download_file(file_uuid, str(dest_path), progress_callback=file_progress)
+                # Use download_url if available, otherwise fall back to UUID-based download
+                if download_url:
+                    api.download_file(download_url, str(dest_path), progress_callback=file_progress)
+                else:
+                    api.download_file_by_uuid(file_uuid, str(dest_path), progress_callback=file_progress)
+
                 completed += 1
                 self._update_progress_safe(completed, total_files, f"Downloaded {filename}")
             except Exception as e:
