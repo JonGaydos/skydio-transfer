@@ -1,0 +1,51 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --windowed --name SkydioTransfer --icon NONE skydio_transfer.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SkydioTransfer
+          path: dist/SkydioTransfer.exe
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SkydioTransfer
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SkydioTransfer.exe
+          generate_release_notes: true
