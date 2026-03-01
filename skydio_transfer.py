@@ -63,13 +63,17 @@ class SkydioAPI:
             h["X-Api-Token-Id"] = self.token_id
         return h
 
-    def get_flights(self):
-        """Fetch all flights. Handles pagination."""
+    def get_flights(self, date_from=None, date_to=None):
+        """Fetch flights, optionally filtered by date range. Handles pagination."""
         all_flights = []
         page = 1
 
         while True:
             params = {"per_page": 100, "page_number": page}
+            if date_from:
+                params["takeoff_after"] = f"{date_from}T00:00:00Z"
+            if date_to:
+                params["takeoff_before"] = f"{date_to}T23:59:59Z"
             resp = requests.get(
                 f"{BASE_URL}/flights", headers=self._headers(), params=params, timeout=30
             )
@@ -548,16 +552,52 @@ class SkydioTransferApp:
         if not api:
             return
 
+        # Read and validate date filters
+        date_from = self.date_from.get()
+        date_to = self.date_to.get()
+
+        if date_from:
+            try:
+                date_type.fromisoformat(date_from)
+            except ValueError:
+                messagebox.showerror("Invalid Date", f"Date From '{date_from}' is not valid.\nUse YYYY-MM-DD format.")
+                return
+
+        if date_to:
+            try:
+                date_type.fromisoformat(date_to)
+            except ValueError:
+                messagebox.showerror("Invalid Date", f"Date To '{date_to}' is not valid.\nUse YYYY-MM-DD format.")
+                return
+
+        # Warn if no date range set — could be very slow
+        if not date_from and not date_to:
+            if not messagebox.askyesno(
+                "No Date Filter",
+                "No date range is set. This will fetch ALL flights and media,\n"
+                "which can take a long time with many flights.\n\n"
+                "Set a date range first to speed things up.\n\n"
+                "Continue anyway?"
+            ):
+                return
+
         self._set_status("Fetching flights...")
         self.fetch_btn.config(state=tk.DISABLED)
         self.download_btn.config(state=tk.DISABLED)
 
         def worker():
             try:
-                # Step 1: Fetch all flights
-                flights = api.get_flights()
+                # Step 1: Fetch flights (filtered by date at the API level)
+                flights = api.get_flights(date_from=date_from, date_to=date_to)
                 total = len(flights)
-                self._set_status_safe(f"Found {total} flights. Loading media...")
+                range_desc = ""
+                if date_from and date_to:
+                    range_desc = f" ({date_from} to {date_to})"
+                elif date_from:
+                    range_desc = f" (from {date_from})"
+                elif date_to:
+                    range_desc = f" (through {date_to})"
+                self._set_status_safe(f"Found {total} flights{range_desc}. Loading media...")
 
                 # Step 2: Fetch media for each flight
                 enriched_media = []
