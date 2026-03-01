@@ -3,13 +3,14 @@ Skydio Media Transfer - Portable Windows Application
 Downloads media from Skydio Cloud to a local folder, organized by date.
 """
 
+import calendar
 import json
 import os
 import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from datetime import datetime
+from datetime import datetime, date as date_type
 from pathlib import Path
 
 import requests
@@ -154,6 +155,231 @@ def parse_takeoff(flight):
 
 
 # ──────────────────────────────────────────────
+# Calendar Popup (pure tkinter, no dependencies)
+# ──────────────────────────────────────────────
+
+class CalendarPopup(tk.Toplevel):
+    """A month-view calendar popup for picking a date."""
+
+    def __init__(self, parent, callback, initial_date=None):
+        super().__init__(parent)
+        self.callback = callback
+        self.transient(parent)
+        self.grab_set()
+        self.title("Pick a Date")
+        self.resizable(False, False)
+
+        today = initial_date or date_type.today()
+        self.year = today.year
+        self.month = today.month
+
+        self._build()
+        self._center_on_parent(parent)
+
+    def _center_on_parent(self, parent):
+        self.update_idletasks()
+        pw = parent.winfo_rootx()
+        ph = parent.winfo_rooty()
+        px = parent.winfo_width()
+        py = parent.winfo_height()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        x = pw + (px - w) // 2
+        y = ph + (py - h) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _build(self):
+        self.configure(padx=8, pady=8)
+
+        # Navigation row
+        nav = ttk.Frame(self)
+        nav.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(nav, text="<<", width=3, command=self._prev_year).pack(side=tk.LEFT)
+        ttk.Button(nav, text="<", width=3, command=self._prev_month).pack(side=tk.LEFT, padx=2)
+
+        self.header_label = ttk.Label(nav, text="", font=("Segoe UI", 10, "bold"), anchor=tk.CENTER)
+        self.header_label.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        ttk.Button(nav, text=">", width=3, command=self._next_month).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(nav, text=">>", width=3, command=self._next_year).pack(side=tk.RIGHT)
+
+        # Day-of-week headers
+        dow_frame = ttk.Frame(self)
+        dow_frame.pack(fill=tk.X)
+        for day_name in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
+            lbl = ttk.Label(dow_frame, text=day_name, width=5, anchor=tk.CENTER,
+                            font=("Segoe UI", 9, "bold"))
+            lbl.pack(side=tk.LEFT, padx=1)
+
+        # Day grid
+        self.day_frame = ttk.Frame(self)
+        self.day_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Today button
+        bottom = ttk.Frame(self)
+        bottom.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(bottom, text="Today", command=self._pick_today).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Clear", command=self._clear).pack(side=tk.RIGHT)
+
+        self._draw_month()
+
+    def _draw_month(self):
+        for widget in self.day_frame.winfo_children():
+            widget.destroy()
+
+        self.header_label.config(
+            text=f"{calendar.month_name[self.month]} {self.year}"
+        )
+
+        today = date_type.today()
+        cal = calendar.monthcalendar(self.year, self.month)
+
+        for week in cal:
+            row_frame = ttk.Frame(self.day_frame)
+            row_frame.pack(fill=tk.X)
+            for day in week:
+                if day == 0:
+                    lbl = ttk.Label(row_frame, text="", width=5)
+                    lbl.pack(side=tk.LEFT, padx=1, pady=1)
+                else:
+                    is_today = (day == today.day and self.month == today.month
+                                and self.year == today.year)
+                    btn = tk.Button(
+                        row_frame, text=str(day), width=4,
+                        relief=tk.FLAT if not is_today else tk.SOLID,
+                        bg="#e0e8ff" if is_today else "#f0f0f0",
+                        activebackground="#c0d0ff",
+                        font=("Segoe UI", 9, "bold" if is_today else "normal"),
+                        command=lambda d=day: self._pick_day(d),
+                    )
+                    btn.pack(side=tk.LEFT, padx=1, pady=1)
+
+    def _prev_month(self):
+        if self.month == 1:
+            self.month = 12
+            self.year -= 1
+        else:
+            self.month -= 1
+        self._draw_month()
+
+    def _next_month(self):
+        if self.month == 12:
+            self.month = 1
+            self.year += 1
+        else:
+            self.month += 1
+        self._draw_month()
+
+    def _prev_year(self):
+        self.year -= 1
+        self._draw_month()
+
+    def _next_year(self):
+        self.year += 1
+        self._draw_month()
+
+    def _pick_day(self, day):
+        picked = date_type(self.year, self.month, day)
+        self.callback(picked.isoformat())
+        self.destroy()
+
+    def _pick_today(self):
+        picked = date_type.today()
+        self.callback(picked.isoformat())
+        self.destroy()
+
+    def _clear(self):
+        self.callback("")
+        self.destroy()
+
+
+# ──────────────────────────────────────────────
+# Date Entry Widget (text entry + calendar button)
+# ──────────────────────────────────────────────
+
+class DateEntry(ttk.Frame):
+    """A date field with a text entry and a calendar popup button."""
+
+    def __init__(self, parent, placeholder="All dates", on_change=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.placeholder = placeholder
+        self.on_change = on_change
+        self._has_focus = False
+
+        self.entry = ttk.Entry(self, width=14)
+        self.entry.pack(side=tk.LEFT)
+
+        self.cal_btn = ttk.Button(self, text="\U0001f4c5", width=3, command=self._open_calendar)
+        self.cal_btn.pack(side=tk.LEFT, padx=(2, 0))
+
+        # Placeholder behavior
+        self._show_placeholder()
+        self.entry.bind("<FocusIn>", self._on_focus_in)
+        self.entry.bind("<FocusOut>", self._on_focus_out)
+        self.entry.bind("<KeyRelease>", self._on_key)
+
+    def _show_placeholder(self):
+        if not self.entry.get():
+            self.entry.insert(0, self.placeholder)
+            self.entry.config(foreground="gray")
+
+    def _on_focus_in(self, event):
+        self._has_focus = True
+        if self.entry.get() == self.placeholder:
+            self.entry.delete(0, tk.END)
+            self.entry.config(foreground="black")
+
+    def _on_focus_out(self, event):
+        self._has_focus = False
+        if not self.entry.get().strip():
+            self.entry.delete(0, tk.END)
+            self._show_placeholder()
+            if self.on_change:
+                self.on_change()
+
+    def _on_key(self, event):
+        if self.on_change:
+            self.on_change()
+
+    def _open_calendar(self):
+        # Try to parse current value as initial date
+        initial = None
+        val = self.get()
+        if val:
+            try:
+                initial = date_type.fromisoformat(val)
+            except ValueError:
+                pass
+        CalendarPopup(self.winfo_toplevel(), self._calendar_callback, initial)
+
+    def _calendar_callback(self, date_str):
+        self.entry.delete(0, tk.END)
+        if date_str:
+            self.entry.config(foreground="black")
+            self.entry.insert(0, date_str)
+        else:
+            self._show_placeholder()
+        if self.on_change:
+            self.on_change()
+
+    def get(self):
+        """Return the date string, or empty string if placeholder/empty."""
+        val = self.entry.get().strip()
+        if val == self.placeholder:
+            return ""
+        return val
+
+    def set(self, value):
+        self.entry.delete(0, tk.END)
+        if value:
+            self.entry.config(foreground="black")
+            self.entry.insert(0, value)
+        else:
+            self._show_placeholder()
+
+
+# ──────────────────────────────────────────────
 # GUI Application
 # ──────────────────────────────────────────────
 
@@ -167,7 +393,6 @@ class SkydioTransferApp:
 
         # Data stores
         self.all_media = []       # list of dicts with enriched media info
-        self.displayed_ids = []   # Treeview item IDs currently shown
         self.available_dates = [] # sorted unique date strings
         self.downloading = False
 
@@ -211,16 +436,14 @@ class SkydioTransferApp:
         filter_row.pack(fill=tk.X)
 
         ttk.Label(filter_row, text="Date From:").pack(side=tk.LEFT)
-        self.date_from_combo = ttk.Combobox(filter_row, width=14, state="readonly")
-        self.date_from_combo.pack(side=tk.LEFT, padx=(4, 12))
-        self.date_from_combo.set("All")
-        self.date_from_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_date_filter())
+        self.date_from = DateEntry(filter_row, placeholder="All dates",
+                                   on_change=self._apply_date_filter)
+        self.date_from.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Label(filter_row, text="Date To:").pack(side=tk.LEFT)
-        self.date_to_combo = ttk.Combobox(filter_row, width=14, state="readonly")
-        self.date_to_combo.pack(side=tk.LEFT, padx=(4, 12))
-        self.date_to_combo.set("All")
-        self.date_to_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_date_filter())
+        self.date_to = DateEntry(filter_row, placeholder="All dates",
+                                 on_change=self._apply_date_filter)
+        self.date_to.pack(side=tk.LEFT, padx=(4, 12))
 
         self.fetch_btn = ttk.Button(filter_row, text="Fetch Media", command=self._fetch_all)
         self.fetch_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -254,8 +477,6 @@ class SkydioTransferApp:
         self._sort_reverse = {}  # track sort direction per column
 
         # Select / Deselect buttons
-        btn_row = ttk.Frame(media_frame)
-        # Place below treeview by re-packing — actually put outside
         media_frame_bottom = ttk.Frame(self.root)
         media_frame_bottom.pack(fill=tk.X, padx=8)
 
@@ -389,33 +610,38 @@ class SkydioTransferApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _populate_media(self, media_list):
-        """Populate the treeview and date dropdowns with fetched media."""
+        """Populate the treeview with fetched media."""
         self.all_media = media_list
 
-        # Build sorted unique dates for the dropdowns
-        dates = sorted(set(m["date"] for m in media_list if m["date"] != "unknown"))
-        self.available_dates = dates
-
-        date_options = ["All"] + dates
-        self.date_from_combo["values"] = date_options
-        self.date_to_combo["values"] = date_options
-        self.date_from_combo.set("All")
-        self.date_to_combo.set("All")
-
-        # Show all media
-        self._refresh_tree(media_list)
-        self._set_status(f"Loaded {len(media_list)} media files from {len(self.available_dates)} flight dates.")
+        # Show all media (date filter will apply if user has typed dates)
+        self._apply_date_filter()
+        dates_count = len(set(m["date"] for m in media_list if m["date"] != "unknown"))
+        self._set_status(f"Loaded {len(media_list)} media files from {dates_count} flight dates.")
 
     def _apply_date_filter(self):
-        """Filter the displayed media based on the date dropdown selections."""
-        date_from = self.date_from_combo.get()
-        date_to = self.date_to_combo.get()
+        """Filter the displayed media based on the date entry values."""
+        if not self.all_media:
+            return
+
+        date_from = self.date_from.get()
+        date_to = self.date_to.get()
 
         filtered = self.all_media
-        if date_from != "All":
-            filtered = [m for m in filtered if m["date"] >= date_from]
-        if date_to != "All":
-            filtered = [m for m in filtered if m["date"] <= date_to]
+
+        if date_from:
+            # Validate format
+            try:
+                date_type.fromisoformat(date_from)
+                filtered = [m for m in filtered if m["date"] >= date_from]
+            except ValueError:
+                pass  # ignore invalid partial typing
+
+        if date_to:
+            try:
+                date_type.fromisoformat(date_to)
+                filtered = [m for m in filtered if m["date"] <= date_to]
+            except ValueError:
+                pass
 
         self._refresh_tree(filtered)
 
