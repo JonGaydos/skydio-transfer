@@ -356,9 +356,11 @@ class SkydioTransferApp:
                 flights = api.get_flights(date_from, date_to)
                 self.root.after(0, lambda: self._populate_flights(flights))
             except requests.exceptions.HTTPError as e:
-                self.root.after(0, lambda: self._handle_api_error(e))
+                err = e
+                self.root.after(0, lambda: self._handle_api_error(err))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                msg = str(e)
+                self.root.after(0, lambda: messagebox.showerror("Error", msg))
             finally:
                 self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
 
@@ -454,7 +456,8 @@ class SkydioTransferApp:
             try:
                 self._download_flights(api, flights_to_download, output_folder)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Download Error", str(e)))
+                msg = str(e)
+                self.root.after(0, lambda: messagebox.showerror("Download Error", msg))
             finally:
                 self.downloading = False
                 self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
