@@ -17,15 +17,24 @@ No installation required. Just run the `.exe`.
 
 ## Usage
 
-1. Optionally set a date range to filter flights
-2. Click **Fetch Flights** to load your flight list
-3. Check the flights you want to download
+1. Optionally set a date range to filter media
+2. Click **Fetch Media** to load your media list
+3. Select files in the list (click, Ctrl+click, or **Select All**)
 4. Choose an output folder with **Browse**
-5. Click **Download Selected**
+5. Click **Add Selected to Queue** — downloads start in the background
+6. Keep browsing and adding more files while the queue runs
 
 Files are saved in date subfolders: `OutputFolder/2024-03-15/photo.jpg`
 
 Already-downloaded files (matching name and size) are automatically skipped.
+
+### Queue Features
+
+- **Auto-retry** — failed downloads retry up to 3 times automatically
+- **Retry Failed** — re-queue all failed/cancelled items with one click
+- **Cancel Current** — stops the active download immediately
+- **Clear Completed** / **Clear All** — manage the queue list
+- Column headers in the media list are sortable (click to toggle)
 
 ## Building from Source
 
