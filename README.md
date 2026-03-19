@@ -48,3 +48,13 @@ pyinstaller --onefile --windowed --name SkydioTransfer skydio_transfer.py
 The `.exe` will be in the `dist/` folder.
 
 Alternatively, push to GitHub and the Actions workflow builds it automatically.
+
+## Disclaimer
+
+This is an independent personal project built with the assistance of [Claude](https://claude.ai). **This project is not affiliated with, endorsed by, or associated with Skydio, Inc. in any way.** Use of this software is at your own risk.
+
+This application is not intended for use on government systems or networks.
+
+## Privacy
+
+This application does not collect, transmit, or store any data externally. Your API token and settings are saved locally in a `config.json` file on your machine and are never uploaded anywhere. All communication is directly between your computer and the official Skydio Cloud API.
