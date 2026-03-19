@@ -36,6 +36,17 @@ Already-downloaded files (matching name and size) are automatically skipped.
 - **Clear Completed** / **Clear All** — manage the queue list
 - Column headers in the media list are sortable (click to toggle)
 
+## Saving to SharePoint
+
+You can download media directly into a SharePoint document library by using a locally synced folder.
+
+1. Open the SharePoint document library in your browser
+2. Click **Sync** to sync the library to your computer via OneDrive for Business
+3. In Skydio Media Transfer, click **Browse** and select the synced folder (typically under `C:\Users\<you>\OneDrive - <org>\...`)
+4. Downloaded files will automatically sync to SharePoint via OneDrive
+
+**Tip:** Enable **Files On-Demand** in OneDrive settings to automatically free up local disk space after files sync to the cloud. Your local machine acts as a temporary pass-through — files remain accessible in SharePoint without taking up local storage. You can also right-click synced files in File Explorer and choose **Free up space** to manually reclaim disk space.
+
 ## Building from Source
 
 Requires Python 3.10+:
