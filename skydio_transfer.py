@@ -497,6 +497,15 @@ class SkydioTransferApp:
         self.output_entry.pack(side=tk.LEFT, padx=(4, 4), fill=tk.X, expand=True)
         ttk.Button(folder_row, text="Browse", command=self._browse_folder).pack(side=tk.LEFT)
 
+        options_row = ttk.Frame(add_frame)
+        options_row.pack(fill=tk.X, pady=(4, 0))
+
+        self.use_date_subfolders = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            options_row, text="Organize into date subfolders",
+            variable=self.use_date_subfolders
+        ).pack(side=tk.LEFT)
+
         btn_row = ttk.Frame(add_frame)
         btn_row.pack(fill=tk.X, pady=(8, 0))
 
@@ -790,6 +799,7 @@ class SkydioTransferApp:
                 continue
 
             self._queue_counter += 1
+            use_subfolders = self.use_date_subfolders.get()
             q_item = {
                 "q_id": str(self._queue_counter),
                 "uuid": media["uuid"],
@@ -798,6 +808,7 @@ class SkydioTransferApp:
                 "size": media["size"],
                 "download_url": media.get("download_url", ""),
                 "output_folder": output_folder,
+                "use_date_subfolders": use_subfolders,
                 "status": "Queued",
             }
 
@@ -805,7 +816,7 @@ class SkydioTransferApp:
                 self.download_queue.append(q_item)
 
             # Add to queue treeview
-            dest_display = str(Path(output_folder) / media["date"])
+            dest_display = str(Path(output_folder) / media["date"]) if use_subfolders else output_folder
             self.queue_tree.insert("", tk.END, iid=q_item["q_id"], values=(
                 media["filename"], "Queued", dest_display,
             ))
@@ -932,10 +943,13 @@ class SkydioTransferApp:
                 download_url = item.get("download_url", "")
                 file_uuid = item["uuid"]
 
-                # Create date subfolder
-                date_folder = Path(output_folder) / date_str
-                date_folder.mkdir(parents=True, exist_ok=True)
-                dest_path = date_folder / filename
+                # Determine destination path
+                if item.get("use_date_subfolders", True):
+                    dest_folder = Path(output_folder) / date_str
+                else:
+                    dest_folder = Path(output_folder)
+                dest_folder.mkdir(parents=True, exist_ok=True)
+                dest_path = dest_folder / filename
 
                 # Skip if already exists with matching size
                 if dest_path.exists():
