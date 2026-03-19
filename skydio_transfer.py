@@ -6,7 +6,9 @@ Downloads media from Skydio Cloud to a local folder, organized by date.
 import calendar
 import json
 import os
+import queue
 import sys
+import time
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -49,6 +51,10 @@ def save_config(data):
 BASE_URL = "https://api.skydio.com/api/v0"
 
 
+class _DownloadCancelled(Exception):
+    """Raised when a download is cancelled mid-stream."""
+
+
 class SkydioAPI:
     def __init__(self, api_token, token_id=""):
         self.api_token = api_token
@@ -80,7 +86,7 @@ class SkydioAPI:
                 params["captured_before"] = f"{date_to}T23:59:59Z"
 
             resp = requests.get(
-                f"{BASE_URL}/media_files", headers=self._headers(), params=params, timeout=30
+                f"{BASE_URL}/media_files", headers=self._headers(), params=params, timeout=180
             )
             resp.raise_for_status()
             data = resp.json().get("data", {})
@@ -101,10 +107,8 @@ class SkydioAPI:
 
         return all_files
 
-    def download_file(self, download_url, dest_path, progress_callback=None):
+    def download_file(self, download_url, dest_path, progress_callback=None, cancel_check=None):
         """Download a media file using its direct download URL."""
-        # Use the direct download_url from the media response.
-        # Fall back to the old /media/download/{uuid} endpoint if needed.
         resp = requests.get(
             download_url, headers=self._headers(), stream=True, timeout=120
         )
@@ -115,15 +119,17 @@ class SkydioAPI:
 
         with open(dest_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=65536):
+                if cancel_check and cancel_check():
+                    raise _DownloadCancelled()
                 f.write(chunk)
                 downloaded += len(chunk)
                 if progress_callback and total > 0:
                     progress_callback(downloaded, total)
 
-    def download_file_by_uuid(self, file_uuid, dest_path, progress_callback=None):
+    def download_file_by_uuid(self, file_uuid, dest_path, progress_callback=None, cancel_check=None):
         """Download a media file by UUID (fallback method)."""
         url = f"{BASE_URL}/media/download/{file_uuid}"
-        self.download_file(url, dest_path, progress_callback)
+        self.download_file(url, dest_path, progress_callback, cancel_check)
 
 
 # ──────────────────────────────────────────────
@@ -373,17 +379,26 @@ class SkydioTransferApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Skydio Media Transfer")
-        self.root.geometry("800x720")
-        self.root.minsize(650, 580)
+        self.root.geometry("800x900")
+        self.root.minsize(650, 700)
         self.root.resizable(True, True)
 
         # Data stores
         self.all_media = []       # list of dicts with media info
-        self.downloading = False
+
+        # Download queue: list of dicts with media info + "output_folder" + "status"
+        self.download_queue = []       # ordered list of queue items
+        self._queue_lock = threading.Lock()
+        self._queue_pending = queue.Queue()  # signals worker that new items exist
         self.cancel_requested = False
+        self._queue_counter = 0  # unique id for each queue item
 
         self._build_ui()
         self._load_saved_config()
+
+        # Start the persistent queue worker thread
+        self._worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
+        self._worker_thread.start()
 
     # ── UI Construction ──
 
@@ -470,11 +485,11 @@ class SkydioTransferApp:
         self.media_count_label = ttk.Label(media_frame_bottom, text="")
         self.media_count_label.pack(side=tk.RIGHT)
 
-        # --- Download Frame ---
-        dl_frame = ttk.LabelFrame(self.root, text="Download", padding=10)
-        dl_frame.pack(fill=tk.X, **pad)
+        # --- Add to Queue Frame ---
+        add_frame = ttk.LabelFrame(self.root, text="Add to Download Queue", padding=10)
+        add_frame.pack(fill=tk.X, **pad)
 
-        folder_row = ttk.Frame(dl_frame)
+        folder_row = ttk.Frame(add_frame)
         folder_row.pack(fill=tk.X)
 
         ttk.Label(folder_row, text="Output Folder:").pack(side=tk.LEFT)
@@ -482,19 +497,57 @@ class SkydioTransferApp:
         self.output_entry.pack(side=tk.LEFT, padx=(4, 4), fill=tk.X, expand=True)
         ttk.Button(folder_row, text="Browse", command=self._browse_folder).pack(side=tk.LEFT)
 
-        btn_row = ttk.Frame(dl_frame)
-        btn_row.pack(fill=tk.X, pady=(8, 4))
+        btn_row = ttk.Frame(add_frame)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
 
-        self.download_btn = ttk.Button(btn_row, text="Download Selected", command=self._start_download)
-        self.download_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.add_queue_btn = ttk.Button(btn_row, text="Add Selected to Queue", command=self._add_to_queue)
+        self.add_queue_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._cancel_download, state=tk.DISABLED)
-        self.cancel_btn.pack(side=tk.LEFT, padx=(4, 0))
+        # --- Download Queue Frame ---
+        queue_frame = ttk.LabelFrame(self.root, text="Download Queue", padding=10)
+        queue_frame.pack(fill=tk.BOTH, expand=True, **pad)
 
-        self.progress_bar = ttk.Progressbar(dl_frame, mode="determinate")
+        # Queue Treeview
+        q_columns = ("filename", "status", "destination")
+        self.queue_tree = ttk.Treeview(queue_frame, columns=q_columns, show="headings",
+                                       selectmode="extended", height=6)
+
+        self.queue_tree.heading("filename", text="Filename")
+        self.queue_tree.heading("status", text="Status")
+        self.queue_tree.heading("destination", text="Destination")
+
+        self.queue_tree.column("filename", width=250, minwidth=120)
+        self.queue_tree.column("status", width=100, minwidth=70)
+        self.queue_tree.column("destination", width=250, minwidth=100)
+
+        q_scroll = ttk.Scrollbar(queue_frame, orient=tk.VERTICAL, command=self.queue_tree.yview)
+        self.queue_tree.configure(yscrollcommand=q_scroll.set)
+
+        self.queue_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        q_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Queue control row
+        queue_ctrl = ttk.Frame(self.root)
+        queue_ctrl.pack(fill=tk.X, padx=8)
+
+        self.cancel_btn = ttk.Button(queue_ctrl, text="Cancel Current", command=self._cancel_download)
+        self.cancel_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        ttk.Button(queue_ctrl, text="Retry Failed", command=self._retry_failed).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(queue_ctrl, text="Clear Completed", command=self._clear_completed).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(queue_ctrl, text="Clear All", command=self._clear_all_queue).pack(side=tk.LEFT)
+
+        self.queue_count_label = ttk.Label(queue_ctrl, text="Queue: 0 items")
+        self.queue_count_label.pack(side=tk.RIGHT)
+
+        # Progress bar and status
+        progress_frame = ttk.Frame(self.root)
+        progress_frame.pack(fill=tk.X, padx=8, pady=(4, 8))
+
+        self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate")
         self.progress_bar.pack(fill=tk.X, pady=(0, 4))
 
-        self.status_label = ttk.Label(dl_frame, text="Ready.", anchor=tk.W)
+        self.status_label = ttk.Label(progress_frame, text="Ready.", anchor=tk.W)
         self.status_label.pack(fill=tk.X)
 
     # ── Token Visibility ──
@@ -569,7 +622,7 @@ class SkydioTransferApp:
 
         self._set_status("Fetching media files...")
         self.fetch_btn.config(state=tk.DISABLED)
-        self.download_btn.config(state=tk.DISABLED)
+        self.add_queue_btn.config(state=tk.DISABLED)
 
         def worker():
             try:
@@ -621,7 +674,7 @@ class SkydioTransferApp:
                 self.root.after(0, lambda: messagebox.showerror("Error", msg))
             finally:
                 self.root.after(0, lambda: self.fetch_btn.config(state=tk.NORMAL))
-                self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.add_queue_btn.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -693,19 +746,14 @@ class SkydioTransferApp:
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, folder)
 
-    # ── Download ──
+    # ── Download Queue ──
 
-    def _cancel_download(self):
-        self.cancel_requested = True
-        self._set_status("Cancelling...")
-
-    def _start_download(self):
-        if self.downloading:
-            return
-
+    def _add_to_queue(self):
         selected_ids = self.tree.selection()
         if not selected_ids:
-            messagebox.showinfo("Nothing Selected", "Select at least one file to download.\n\nTip: Click a row to select, Ctrl+click for multiple, or use Select All.")
+            messagebox.showinfo("Nothing Selected",
+                                "Select at least one file to add to the queue.\n\n"
+                                "Tip: Click a row to select, Ctrl+click for multiple, or use Select All.")
             return
 
         output_folder = self.output_entry.get().strip()
@@ -713,8 +761,9 @@ class SkydioTransferApp:
             messagebox.showinfo("No Folder", "Choose an output folder first.")
             return
 
-        api = self._get_api()
-        if not api:
+        # Validate API credentials before queuing
+        if not self.token_entry.get().strip():
+            messagebox.showerror("Error", "Please enter your API Token.")
             return
 
         # Save output folder preference
@@ -722,99 +771,248 @@ class SkydioTransferApp:
         cfg["output_folder"] = output_folder
         save_config(cfg)
 
-        # Build download list from selected tree items
+        # Build queue items from selected tree items
         media_by_uuid = {m["uuid"]: m for m in self.all_media}
-        to_download = [media_by_uuid[uid] for uid in selected_ids if uid in media_by_uuid]
+        added = 0
 
-        if not to_download:
-            return
+        # Check which UUIDs are already queued (pending/downloading)
+        with self._queue_lock:
+            already_queued = {
+                item["uuid"] for item in self.download_queue
+                if item["status"] in ("Queued", "Downloading")
+            }
 
-        self.downloading = True
-        self.cancel_requested = False
-        self.download_btn.config(state=tk.DISABLED)
-        self.fetch_btn.config(state=tk.DISABLED)
-        self.cancel_btn.config(state=tk.NORMAL)
-        self.progress_bar["value"] = 0
+        for uid in selected_ids:
+            media = media_by_uuid.get(uid)
+            if not media:
+                continue
+            if media["uuid"] in already_queued:
+                continue
 
-        def worker():
+            self._queue_counter += 1
+            q_item = {
+                "q_id": str(self._queue_counter),
+                "uuid": media["uuid"],
+                "filename": media["filename"],
+                "date": media["date"],
+                "size": media["size"],
+                "download_url": media.get("download_url", ""),
+                "output_folder": output_folder,
+                "status": "Queued",
+            }
+
+            with self._queue_lock:
+                self.download_queue.append(q_item)
+
+            # Add to queue treeview
+            dest_display = str(Path(output_folder) / media["date"])
+            self.queue_tree.insert("", tk.END, iid=q_item["q_id"], values=(
+                media["filename"], "Queued", dest_display,
+            ))
+            added += 1
+
+        self._update_queue_count()
+
+        if added > 0:
+            self._set_status(f"Added {added} file(s) to queue.")
+            # Signal the worker thread
+            self._queue_pending.put(True)
+        else:
+            self._set_status("Selected files are already in the queue.")
+
+        # Deselect in media tree so user can pick more
+        self.tree.selection_remove(*selected_ids)
+
+    def _cancel_download(self):
+        self.cancel_requested = True
+        self._set_status("Cancelling current download...")
+
+    def _retry_failed(self):
+        requeued = 0
+        with self._queue_lock:
+            for item in self.download_queue:
+                if item["status"] in ("Failed", "Cancelled"):
+                    item["status"] = "Queued"
+                    requeued += 1
+                    self._update_queue_item_status(item["q_id"], "Queued")
+        if requeued > 0:
+            self._set_status(f"Re-queued {requeued} file(s).")
+            self._queue_pending.put(True)
+        else:
+            self._set_status("No failed items to retry.")
+
+    def _clear_completed(self):
+        with self._queue_lock:
+            to_remove = [
+                item for item in self.download_queue
+                if item["status"] in ("Done", "Skipped", "Failed", "Cancelled")
+            ]
+            for item in to_remove:
+                self.download_queue.remove(item)
+                try:
+                    self.queue_tree.delete(item["q_id"])
+                except tk.TclError:
+                    pass
+        self._update_queue_count()
+
+    def _clear_all_queue(self):
+        # Cancel any active download first
+        self.cancel_requested = True
+        with self._queue_lock:
+            # Remove non-active items immediately; active one will be cancelled by worker
+            to_remove = [
+                item for item in self.download_queue
+                if item["status"] != "Downloading"
+            ]
+            for item in to_remove:
+                self.download_queue.remove(item)
+                try:
+                    self.queue_tree.delete(item["q_id"])
+                except tk.TclError:
+                    pass
+        self._update_queue_count()
+
+    def _update_queue_count(self):
+        with self._queue_lock:
+            pending = sum(1 for item in self.download_queue if item["status"] == "Queued")
+            total = len(self.download_queue)
+        self.queue_count_label.config(text=f"Queue: {pending} pending / {total} total")
+
+    def _update_queue_item_status(self, q_id, status):
+        """Thread-safe update of a queue item's status in the Treeview."""
+        def update():
             try:
-                self._download_media(api, to_download, output_folder)
-            except Exception as e:
-                msg = str(e)
-                self.root.after(0, lambda: messagebox.showerror("Download Error", msg))
-            finally:
-                self.downloading = False
+                current_values = self.queue_tree.item(q_id, "values")
+                self.queue_tree.item(q_id, values=(current_values[0], status, current_values[2]))
+            except tk.TclError:
+                pass
+            self._update_queue_count()
+        self.root.after(0, update)
+
+    def _queue_worker(self):
+        """Background worker that processes the download queue."""
+        while True:
+            # Wait for signal that items are available
+            self._queue_pending.get()
+
+            # Process all pending items
+            while True:
+                # Find next pending item
+                item = None
+                with self._queue_lock:
+                    for q_item in self.download_queue:
+                        if q_item["status"] == "Queued":
+                            q_item["status"] = "Downloading"
+                            item = q_item
+                            break
+
+                if item is None:
+                    # No more pending items
+                    self._set_status_safe("Queue complete.")
+                    self.root.after(0, lambda: self.progress_bar.configure(value=0))
+                    break
+
                 self.cancel_requested = False
-                self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL))
-                self.root.after(0, lambda: self.fetch_btn.config(state=tk.NORMAL))
-                self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
+                self._update_queue_item_status(item["q_id"], "Downloading")
 
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _download_media(self, api, media_list, output_folder):
-        total_files = len(media_list)
-        completed = 0
-        skipped = 0
-        errors = 0
-
-        for media in media_list:
-            if self.cancel_requested:
-                self._set_status_safe(
-                    f"Cancelled. {completed - skipped - errors} downloaded, "
-                    f"{skipped} skipped, {errors} errors."
-                )
-                return
-
-            file_uuid = media["uuid"]
-            filename = media["filename"]
-            file_size = media["size"]
-            date_str = media["date"]
-            download_url = media.get("download_url", "")
-
-            # Create date subfolder
-            date_folder = Path(output_folder) / date_str
-            date_folder.mkdir(parents=True, exist_ok=True)
-            dest_path = date_folder / filename
-
-            # Skip if already exists with matching size
-            if dest_path.exists():
-                existing_size = dest_path.stat().st_size
-                if file_size and existing_size == file_size:
-                    skipped += 1
-                    completed += 1
-                    self._update_progress_safe(completed, total_files, f"Skipped {filename} (exists)")
+                # Build API client from current credentials
+                token = self.token_entry.get().strip()
+                token_id = self.token_id_entry.get().strip()
+                if not token:
+                    item["status"] = "Failed"
+                    self._update_queue_item_status(item["q_id"], "Failed")
+                    self._set_status_safe("No API token — skipping.")
                     continue
 
-            self._set_status_safe(f"Downloading {filename} ({completed + 1}/{total_files})...")
+                api = SkydioAPI(token, token_id)
+                filename = item["filename"]
+                output_folder = item["output_folder"]
+                date_str = item["date"]
+                file_size = item["size"]
+                download_url = item.get("download_url", "")
+                file_uuid = item["uuid"]
 
-            try:
-                # Capture current values for the closure
-                _filename = filename
-                _completed = completed
-                _total = total_files
+                # Create date subfolder
+                date_folder = Path(output_folder) / date_str
+                date_folder.mkdir(parents=True, exist_ok=True)
+                dest_path = date_folder / filename
 
-                def file_progress(downloaded, total, fn=_filename, comp=_completed, tot=_total):
-                    pct = downloaded / total * 100 if total else 0
-                    self._set_status_safe(f"Downloading {fn} ({comp + 1}/{tot}) — {pct:.0f}%")
+                # Skip if already exists with matching size
+                if dest_path.exists():
+                    existing_size = dest_path.stat().st_size
+                    if file_size and existing_size == file_size:
+                        item["status"] = "Skipped"
+                        self._update_queue_item_status(item["q_id"], "Skipped")
+                        self._set_status_safe(f"Skipped {filename} (exists)")
+                        continue
 
-                # Use download_url if available, otherwise fall back to UUID-based download
-                if download_url:
-                    api.download_file(download_url, str(dest_path), progress_callback=file_progress)
-                else:
-                    api.download_file_by_uuid(file_uuid, str(dest_path), progress_callback=file_progress)
+                max_retries = 3
+                for attempt in range(1, max_retries + 1):
+                    if self.cancel_requested:
+                        item["status"] = "Cancelled"
+                        self._update_queue_item_status(item["q_id"], "Cancelled")
+                        break
 
-                completed += 1
-                self._update_progress_safe(completed, total_files, f"Downloaded {filename}")
-            except Exception as e:
-                errors += 1
-                completed += 1
-                self._update_progress_safe(
-                    completed, total_files, f"Failed: {filename} — {e}"
-                )
+                    retry_label = f" (attempt {attempt}/{max_retries})" if attempt > 1 else ""
+                    self._set_status_safe(f"Downloading {filename}{retry_label}...")
+                    self._update_queue_item_status(
+                        item["q_id"],
+                        f"Retry {attempt}/{max_retries}" if attempt > 1 else "Downloading",
+                    )
 
-        summary = f"Done! {completed - skipped - errors} downloaded, {skipped} skipped, {errors} errors."
-        self._set_status_safe(summary)
-        self.root.after(0, lambda: messagebox.showinfo("Complete", summary))
+                    try:
+                        _fn = filename
+                        _attempt = attempt
+                        _max = max_retries
+
+                        def file_progress(downloaded, total, fn=_fn, att=_attempt, mx=_max):
+                            pct = downloaded / total * 100 if total else 0
+                            retry_s = f" (attempt {att}/{mx})" if att > 1 else ""
+                            self._set_status_safe(f"Downloading {fn}{retry_s} — {pct:.0f}%")
+                            self.root.after(0, lambda p=pct: self.progress_bar.configure(value=p))
+
+                        cancel_fn = lambda: self.cancel_requested
+
+                        if download_url:
+                            api.download_file(download_url, str(dest_path),
+                                              progress_callback=file_progress, cancel_check=cancel_fn)
+                        else:
+                            api.download_file_by_uuid(file_uuid, str(dest_path),
+                                                      progress_callback=file_progress, cancel_check=cancel_fn)
+
+                        item["status"] = "Done"
+                        self._update_queue_item_status(item["q_id"], "Done")
+                        self._set_status_safe(f"Downloaded {filename}")
+                        break  # success — stop retrying
+
+                    except _DownloadCancelled:
+                        try:
+                            dest_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        item["status"] = "Cancelled"
+                        self._update_queue_item_status(item["q_id"], "Cancelled")
+                        self._set_status_safe(f"Cancelled {filename}")
+                        break  # don't retry cancelled downloads
+
+                    except Exception as e:
+                        # Clean up partial file
+                        try:
+                            dest_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+                        if attempt < max_retries:
+                            wait = attempt * 5  # 5s, 10s
+                            self._set_status_safe(
+                                f"Failed {filename} (attempt {attempt}/{max_retries}): {e} — retrying in {wait}s..."
+                            )
+                            self._update_queue_item_status(item["q_id"], f"Waiting {wait}s...")
+                            time.sleep(wait)
+                        else:
+                            item["status"] = "Failed"
+                            self._update_queue_item_status(item["q_id"], "Failed")
+                            self._set_status_safe(f"Failed: {filename} — {e} (all {max_retries} attempts)")
 
     # ── Thread-safe UI updates ──
 
