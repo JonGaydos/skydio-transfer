@@ -49,6 +49,8 @@ def save_config(data):
 # ──────────────────────────────────────────────
 
 BASE_URL = "https://api.skydio.com/api/v0"
+FONT_FAMILY = "Segoe UI"
+DATE_PLACEHOLDER = "All dates"
 
 
 class _DownloadCancelled(Exception):
@@ -190,7 +192,7 @@ class CalendarPopup(tk.Toplevel):
         ttk.Button(nav, text="<<", width=3, command=self._prev_year).pack(side=tk.LEFT)
         ttk.Button(nav, text="<", width=3, command=self._prev_month).pack(side=tk.LEFT, padx=2)
 
-        self.header_label = ttk.Label(nav, text="", font=("Segoe UI", 10, "bold"), anchor=tk.CENTER)
+        self.header_label = ttk.Label(nav, text="", font=(FONT_FAMILY, 10, "bold"), anchor=tk.CENTER)
         self.header_label.pack(side=tk.LEFT, expand=True, fill=tk.X)
 
         ttk.Button(nav, text=">", width=3, command=self._next_month).pack(side=tk.RIGHT, padx=2)
@@ -201,7 +203,7 @@ class CalendarPopup(tk.Toplevel):
         dow_frame.pack(fill=tk.X)
         for day_name in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
             lbl = ttk.Label(dow_frame, text=day_name, width=5, anchor=tk.CENTER,
-                            font=("Segoe UI", 9, "bold"))
+                            font=(FONT_FAMILY, 9, "bold"))
             lbl.pack(side=tk.LEFT, padx=1)
 
         # Day grid
@@ -231,21 +233,23 @@ class CalendarPopup(tk.Toplevel):
             row_frame = ttk.Frame(self.day_frame)
             row_frame.pack(fill=tk.X)
             for day in week:
-                if day == 0:
-                    lbl = ttk.Label(row_frame, text="", width=5)
-                    lbl.pack(side=tk.LEFT, padx=1, pady=1)
-                else:
-                    is_today = (day == today.day and self.month == today.month
-                                and self.year == today.year)
-                    btn = tk.Button(
-                        row_frame, text=str(day), width=4,
-                        relief=tk.FLAT if not is_today else tk.SOLID,
-                        bg="#e0e8ff" if is_today else "#f0f0f0",
-                        activebackground="#c0d0ff",
-                        font=("Segoe UI", 9, "bold" if is_today else "normal"),
-                        command=lambda d=day: self._pick_day(d),
-                    )
-                    btn.pack(side=tk.LEFT, padx=1, pady=1)
+                self._create_day_cell(row_frame, day, today)
+
+    def _create_day_cell(self, row_frame, day, today):
+        """Create a single day cell (blank label or clickable button) in the calendar grid."""
+        if day == 0:
+            ttk.Label(row_frame, text="", width=5).pack(side=tk.LEFT, padx=1, pady=1)
+            return
+
+        is_today = (day == today.day and self.month == today.month and self.year == today.year)
+        tk.Button(
+            row_frame, text=str(day), width=4,
+            relief=tk.SOLID if is_today else tk.FLAT,
+            bg="#e0e8ff" if is_today else "#f0f0f0",
+            activebackground="#c0d0ff",
+            font=(FONT_FAMILY, 9, "bold" if is_today else "normal"),
+            command=lambda d=day: self._pick_day(d),
+        ).pack(side=tk.LEFT, padx=1, pady=1)
 
     def _prev_month(self):
         if self.month == 1:
@@ -293,7 +297,7 @@ class CalendarPopup(tk.Toplevel):
 class DateEntry(ttk.Frame):
     """A date field with a text entry and a calendar popup button."""
 
-    def __init__(self, parent, placeholder="All dates", on_change=None, **kwargs):
+    def __init__(self, parent, placeholder=DATE_PLACEHOLDER, on_change=None, **kwargs):
         super().__init__(parent, **kwargs)
         self.placeholder = placeholder
         self.on_change = on_change
@@ -437,11 +441,11 @@ class SkydioTransferApp:
         filter_row.pack(fill=tk.X)
 
         ttk.Label(filter_row, text="Date From:").pack(side=tk.LEFT)
-        self.date_from = DateEntry(filter_row, placeholder="All dates")
+        self.date_from = DateEntry(filter_row, placeholder=DATE_PLACEHOLDER)
         self.date_from.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Label(filter_row, text="Date To:").pack(side=tk.LEFT)
-        self.date_to = DateEntry(filter_row, placeholder="All dates")
+        self.date_to = DateEntry(filter_row, placeholder=DATE_PLACEHOLDER)
         self.date_to.pack(side=tk.LEFT, padx=(4, 12))
 
         self.fetch_btn = ttk.Button(filter_row, text="Fetch Media", command=self._fetch_all)
@@ -595,39 +599,61 @@ class SkydioTransferApp:
 
     # ── Fetch Media Directly ──
 
+    def _validate_date_input(self, label, value):
+        """Validate a date string, showing an error dialog on failure. Returns True if valid."""
+        if not value:
+            return True
+        try:
+            date_type.fromisoformat(value)
+            return True
+        except ValueError:
+            messagebox.showerror("Invalid Date", f"{label} '{value}' is not valid.\nUse YYYY-MM-DD format.")
+            return False
+
+    @staticmethod
+    def _enrich_media(mf):
+        """Convert a raw API media dict into an enriched display dict."""
+        cap_time = mf.get("captured_time", "")
+        if cap_time and len(cap_time) >= 16:
+            m_date, m_time = cap_time[:10], cap_time[11:16]
+        elif cap_time and len(cap_time) >= 10:
+            m_date, m_time = cap_time[:10], "—"
+        else:
+            m_date, m_time = "unknown", "—"
+
+        return {
+            "uuid": mf.get("uuid", ""),
+            "filename": mf.get("filename", f"media_{mf.get('uuid', '?')}"),
+            "date": m_date,
+            "time": m_time,
+            "kind": mf.get("kind", "—"),
+            "size": mf.get("size", 0),
+            "size_display": format_size(mf.get("size", 0)),
+            "download_url": mf.get("download_url", ""),
+            "flight_id": mf.get("flight_id", ""),
+        }
+
     def _fetch_all(self):
         api = self._get_api()
         if not api:
             return
 
-        # Read and validate date filters
         date_from = self.date_from.get()
         date_to = self.date_to.get()
 
-        if date_from:
-            try:
-                date_type.fromisoformat(date_from)
-            except ValueError:
-                messagebox.showerror("Invalid Date", f"Date From '{date_from}' is not valid.\nUse YYYY-MM-DD format.")
-                return
+        if not self._validate_date_input("Date From", date_from):
+            return
+        if not self._validate_date_input("Date To", date_to):
+            return
 
-        if date_to:
-            try:
-                date_type.fromisoformat(date_to)
-            except ValueError:
-                messagebox.showerror("Invalid Date", f"Date To '{date_to}' is not valid.\nUse YYYY-MM-DD format.")
-                return
-
-        # Warn if no date range set — could be very slow
-        if not date_from and not date_to:
-            if not messagebox.askyesno(
-                "No Date Filter",
-                "No date range is set. This will fetch ALL media files,\n"
-                "which can take a while with many files.\n\n"
-                "Set a date range first to speed things up.\n\n"
-                "Continue anyway?"
-            ):
-                return
+        if not date_from and not date_to and not messagebox.askyesno(
+            "No Date Filter",
+            "No date range is set. This will fetch ALL media files,\n"
+            "which can take a while with many files.\n\n"
+            "Set a date range first to speed things up.\n\n"
+            "Continue anyway?"
+        ):
+            return
 
         self._set_status("Fetching media files...")
         self.fetch_btn.config(state=tk.DISABLED)
@@ -647,32 +673,7 @@ class SkydioTransferApp:
                     progress_callback=on_page,
                 )
 
-                # Enrich media data for display
-                enriched = []
-                for mf in media_files:
-                    cap_time = mf.get("captured_time", "")
-                    if cap_time and len(cap_time) >= 16:
-                        m_date = cap_time[:10]
-                        m_time = cap_time[11:16]
-                    elif cap_time and len(cap_time) >= 10:
-                        m_date = cap_time[:10]
-                        m_time = "—"
-                    else:
-                        m_date = "unknown"
-                        m_time = "—"
-
-                    enriched.append({
-                        "uuid": mf.get("uuid", ""),
-                        "filename": mf.get("filename", f"media_{mf.get('uuid', '?')}"),
-                        "date": m_date,
-                        "time": m_time,
-                        "kind": mf.get("kind", "—"),
-                        "size": mf.get("size", 0),
-                        "size_display": format_size(mf.get("size", 0)),
-                        "download_url": mf.get("download_url", ""),
-                        "flight_id": mf.get("flight_id", ""),
-                    })
-
+                enriched = [self._enrich_media(mf) for mf in media_files]
                 self.root.after(0, lambda: self._populate_media(enriched))
 
             except requests.exceptions.HTTPError as e:
@@ -691,7 +692,7 @@ class SkydioTransferApp:
         """Populate the treeview with fetched media."""
         self.all_media = media_list
         self._refresh_tree(media_list)
-        dates_count = len(set(m["date"] for m in media_list if m["date"] != "unknown"))
+        dates_count = len({m["date"] for m in media_list if m["date"] != "unknown"})
         self._set_status(f"Loaded {len(media_list)} media files across {dates_count} dates.")
 
     def _refresh_tree(self, media_list):
@@ -717,8 +718,13 @@ class SkydioTransferApp:
         reverse = self._sort_reverse.get(col, False)
         self._sort_reverse[col] = not reverse
 
-        items = [(self.tree.set(iid, col), iid) for iid in self.tree.get_children("")]
-        items.sort(key=lambda x: x[0].lower(), reverse=reverse)
+        if col == "size":
+            # Sort by raw byte size from media data, not the display string
+            size_by_uuid = {m["uuid"]: m["size"] or 0 for m in self.all_media}
+            items = [(size_by_uuid.get(iid, 0), iid) for iid in self.tree.get_children("")]
+        else:
+            items = [(self.tree.set(iid, col), iid) for iid in self.tree.get_children("")]
+        items.sort(key=lambda x: x[0] if col == "size" else x[0].lower(), reverse=reverse)
 
         for index, (_, iid) in enumerate(items):
             self.tree.move(iid, "", index)
@@ -853,34 +859,28 @@ class SkydioTransferApp:
             self._set_status("No failed items to retry.")
 
     def _clear_completed(self):
+        clearable = {"Done", "Skipped", "Failed", "Cancelled"}
         with self._queue_lock:
-            to_remove = [
-                item for item in self.download_queue
-                if item["status"] in ("Done", "Skipped", "Failed", "Cancelled")
-            ]
-            for item in to_remove:
-                self.download_queue.remove(item)
-                try:
-                    self.queue_tree.delete(item["q_id"])
-                except tk.TclError:
-                    pass
+            to_remove = [item for item in self.download_queue if item["status"] in clearable]
+            self.download_queue = [item for item in self.download_queue if item["status"] not in clearable]
+        for item in to_remove:
+            try:
+                self.queue_tree.delete(item["q_id"])
+            except tk.TclError:
+                pass
         self._update_queue_count()
 
     def _clear_all_queue(self):
         # Cancel any active download first
         self.cancel_requested = True
         with self._queue_lock:
-            # Remove non-active items immediately; active one will be cancelled by worker
-            to_remove = [
-                item for item in self.download_queue
-                if item["status"] != "Downloading"
-            ]
-            for item in to_remove:
-                self.download_queue.remove(item)
-                try:
-                    self.queue_tree.delete(item["q_id"])
-                except tk.TclError:
-                    pass
+            to_remove = [item for item in self.download_queue if item["status"] != "Downloading"]
+            self.download_queue = [item for item in self.download_queue if item["status"] == "Downloading"]
+        for item in to_remove:
+            try:
+                self.queue_tree.delete(item["q_id"])
+            except tk.TclError:
+                pass
         self._update_queue_count()
 
     def _update_queue_count(self):
@@ -903,130 +903,130 @@ class SkydioTransferApp:
     def _queue_worker(self):
         """Background worker that processes the download queue."""
         while True:
-            # Wait for signal that items are available
             self._queue_pending.get()
 
-            # Process all pending items
             while True:
-                # Find next pending item
-                item = None
-                with self._queue_lock:
-                    for q_item in self.download_queue:
-                        if q_item["status"] == "Queued":
-                            q_item["status"] = "Downloading"
-                            item = q_item
-                            break
-
+                item = self._claim_next_queued_item()
                 if item is None:
-                    # No more pending items
                     self._set_status_safe("Queue complete.")
                     self.root.after(0, lambda: self.progress_bar.configure(value=0))
                     break
 
                 self.cancel_requested = False
                 self._update_queue_item_status(item["q_id"], "Downloading")
+                self._process_queue_item(item)
 
-                # Build API client from current credentials
-                token = self.token_entry.get().strip()
-                token_id = self.token_id_entry.get().strip()
-                if not token:
+    def _claim_next_queued_item(self):
+        """Find and claim the next pending item in the queue."""
+        with self._queue_lock:
+            for q_item in self.download_queue:
+                if q_item["status"] == "Queued":
+                    q_item["status"] = "Downloading"
+                    return q_item
+        return None
+
+    def _process_queue_item(self, item):
+        """Process a single download queue item."""
+        token = self.token_entry.get().strip()
+        token_id = self.token_id_entry.get().strip()
+        if not token:
+            item["status"] = "Failed"
+            self._update_queue_item_status(item["q_id"], "Failed")
+            self._set_status_safe("No API token — skipping.")
+            return
+
+        api = SkydioAPI(token, token_id)
+        dest_path = self._resolve_dest_path(item)
+
+        # Skip if already exists with matching size
+        if dest_path.exists() and item["size"]:
+            if dest_path.stat().st_size == item["size"]:
+                item["status"] = "Skipped"
+                self._update_queue_item_status(item["q_id"], "Skipped")
+                self._set_status_safe(f"Skipped {item['filename']} (exists)")
+                return
+
+        self._download_with_retries(item, api, dest_path)
+
+    def _resolve_dest_path(self, item):
+        """Determine the destination file path for a queue item."""
+        if item.get("use_date_subfolders", True):
+            dest_folder = Path(item["output_folder"]) / item["date"]
+        else:
+            dest_folder = Path(item["output_folder"])
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        return dest_folder / item["filename"]
+
+    def _download_with_retries(self, item, api, dest_path):
+        """Attempt to download a file with retries."""
+        max_retries = 3
+        cancel_fn = lambda: self.cancel_requested
+
+        for attempt in range(1, max_retries + 1):
+            if self.cancel_requested:
+                item["status"] = "Cancelled"
+                self._update_queue_item_status(item["q_id"], "Cancelled")
+                return
+
+            retry_label = f" (attempt {attempt}/{max_retries})" if attempt > 1 else ""
+            self._set_status_safe(f"Downloading {item['filename']}{retry_label}...")
+            self._update_queue_item_status(
+                item["q_id"],
+                f"Retry {attempt}/{max_retries}" if attempt > 1 else "Downloading",
+            )
+
+            try:
+                _fn = item["filename"]
+                _attempt = attempt
+                _max = max_retries
+
+                def file_progress(downloaded, total, fn=_fn, att=_attempt, mx=_max):
+                    pct = downloaded / total * 100 if total else 0
+                    retry_s = f" (attempt {att}/{mx})" if att > 1 else ""
+                    self._set_status_safe(f"Downloading {fn}{retry_s} — {pct:.0f}%")
+                    self.root.after(0, lambda p=pct: self.progress_bar.configure(value=p))
+
+                download_url = item.get("download_url", "")
+                if download_url:
+                    api.download_file(download_url, str(dest_path),
+                                      progress_callback=file_progress, cancel_check=cancel_fn)
+                else:
+                    api.download_file_by_uuid(item["uuid"], str(dest_path),
+                                              progress_callback=file_progress, cancel_check=cancel_fn)
+
+                item["status"] = "Done"
+                self._update_queue_item_status(item["q_id"], "Done")
+                self._set_status_safe(f"Downloaded {item['filename']}")
+                return
+
+            except _DownloadCancelled:
+                self._cleanup_partial(dest_path)
+                item["status"] = "Cancelled"
+                self._update_queue_item_status(item["q_id"], "Cancelled")
+                self._set_status_safe(f"Cancelled {item['filename']}")
+                return
+
+            except Exception as e:
+                self._cleanup_partial(dest_path)
+                if attempt < max_retries:
+                    wait = attempt * 5
+                    self._set_status_safe(
+                        f"Failed {item['filename']} (attempt {attempt}/{max_retries}): {e} — retrying in {wait}s..."
+                    )
+                    self._update_queue_item_status(item["q_id"], f"Waiting {wait}s...")
+                    time.sleep(wait)
+                else:
                     item["status"] = "Failed"
                     self._update_queue_item_status(item["q_id"], "Failed")
-                    self._set_status_safe("No API token — skipping.")
-                    continue
+                    self._set_status_safe(f"Failed: {item['filename']} — {e} (all {max_retries} attempts)")
 
-                api = SkydioAPI(token, token_id)
-                filename = item["filename"]
-                output_folder = item["output_folder"]
-                date_str = item["date"]
-                file_size = item["size"]
-                download_url = item.get("download_url", "")
-                file_uuid = item["uuid"]
-
-                # Determine destination path
-                if item.get("use_date_subfolders", True):
-                    dest_folder = Path(output_folder) / date_str
-                else:
-                    dest_folder = Path(output_folder)
-                dest_folder.mkdir(parents=True, exist_ok=True)
-                dest_path = dest_folder / filename
-
-                # Skip if already exists with matching size
-                if dest_path.exists():
-                    existing_size = dest_path.stat().st_size
-                    if file_size and existing_size == file_size:
-                        item["status"] = "Skipped"
-                        self._update_queue_item_status(item["q_id"], "Skipped")
-                        self._set_status_safe(f"Skipped {filename} (exists)")
-                        continue
-
-                max_retries = 3
-                for attempt in range(1, max_retries + 1):
-                    if self.cancel_requested:
-                        item["status"] = "Cancelled"
-                        self._update_queue_item_status(item["q_id"], "Cancelled")
-                        break
-
-                    retry_label = f" (attempt {attempt}/{max_retries})" if attempt > 1 else ""
-                    self._set_status_safe(f"Downloading {filename}{retry_label}...")
-                    self._update_queue_item_status(
-                        item["q_id"],
-                        f"Retry {attempt}/{max_retries}" if attempt > 1 else "Downloading",
-                    )
-
-                    try:
-                        _fn = filename
-                        _attempt = attempt
-                        _max = max_retries
-
-                        def file_progress(downloaded, total, fn=_fn, att=_attempt, mx=_max):
-                            pct = downloaded / total * 100 if total else 0
-                            retry_s = f" (attempt {att}/{mx})" if att > 1 else ""
-                            self._set_status_safe(f"Downloading {fn}{retry_s} — {pct:.0f}%")
-                            self.root.after(0, lambda p=pct: self.progress_bar.configure(value=p))
-
-                        cancel_fn = lambda: self.cancel_requested
-
-                        if download_url:
-                            api.download_file(download_url, str(dest_path),
-                                              progress_callback=file_progress, cancel_check=cancel_fn)
-                        else:
-                            api.download_file_by_uuid(file_uuid, str(dest_path),
-                                                      progress_callback=file_progress, cancel_check=cancel_fn)
-
-                        item["status"] = "Done"
-                        self._update_queue_item_status(item["q_id"], "Done")
-                        self._set_status_safe(f"Downloaded {filename}")
-                        break  # success — stop retrying
-
-                    except _DownloadCancelled:
-                        try:
-                            dest_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        item["status"] = "Cancelled"
-                        self._update_queue_item_status(item["q_id"], "Cancelled")
-                        self._set_status_safe(f"Cancelled {filename}")
-                        break  # don't retry cancelled downloads
-
-                    except Exception as e:
-                        # Clean up partial file
-                        try:
-                            dest_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-
-                        if attempt < max_retries:
-                            wait = attempt * 5  # 5s, 10s
-                            self._set_status_safe(
-                                f"Failed {filename} (attempt {attempt}/{max_retries}): {e} — retrying in {wait}s..."
-                            )
-                            self._update_queue_item_status(item["q_id"], f"Waiting {wait}s...")
-                            time.sleep(wait)
-                        else:
-                            item["status"] = "Failed"
-                            self._update_queue_item_status(item["q_id"], "Failed")
-                            self._set_status_safe(f"Failed: {filename} — {e} (all {max_retries} attempts)")
+    @staticmethod
+    def _cleanup_partial(dest_path):
+        """Remove a partially downloaded file."""
+        try:
+            dest_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # ── Thread-safe UI updates ──
 
@@ -1036,30 +1036,21 @@ class SkydioTransferApp:
     def _set_status_safe(self, text):
         self.root.after(0, lambda: self._set_status(text))
 
-    def _update_progress_safe(self, current, total, status_text):
-        def update():
-            if total > 0:
-                self.progress_bar["value"] = current / total * 100
-            self.status_label.config(text=status_text)
-
-        self.root.after(0, update)
-
 
 # ──────────────────────────────────────────────
 # Entry Point
 # ──────────────────────────────────────────────
 
 def main():
-    root = tk.Tk()
-
-    # Set DPI awareness for sharp text on Windows
+    # Set DPI awareness for sharp text on Windows (must be before Tk() creation)
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
 
-    app = SkydioTransferApp(root)
+    root = tk.Tk()
+    SkydioTransferApp(root)
     root.mainloop()
 
 
