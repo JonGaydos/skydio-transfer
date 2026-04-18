@@ -5,6 +5,8 @@ Downloads media from Skydio Cloud to a local folder, organized by date.
 
 import calendar
 import json
+import logging
+import logging.handlers
 import os
 import queue
 import sys
@@ -16,6 +18,8 @@ from datetime import datetime, date as date_type
 from pathlib import Path
 
 import requests
+
+LOGGER = logging.getLogger("skydio_transfer")
 
 # ──────────────────────────────────────────────
 # Configuration Manager
@@ -55,6 +59,38 @@ DATE_PLACEHOLDER = "All dates"
 
 class _DownloadCancelled(Exception):
     """Raised when a download is cancelled mid-stream."""
+
+
+def build_queue_item(media, output_folder, use_subfolders, api_token, token_id, q_id):
+    return {
+        "q_id": str(q_id),
+        "uuid": media["uuid"],
+        "filename": media["filename"],
+        "date": media["date"],
+        "size": media["size"],
+        "download_url": media.get("download_url", ""),
+        "output_folder": output_folder,
+        "use_date_subfolders": use_subfolders,
+        "api_token": api_token,
+        "token_id": token_id,
+        "status": "Queued",
+    }
+
+
+def api_from_item(item):
+    return SkydioAPI(item["api_token"], item.get("token_id", ""))
+
+
+class ProgressThrottle:
+    def __init__(self, min_interval=0.25):
+        self.min_interval = min_interval
+        self.last_emit = None
+
+    def tick(self, now):
+        if self.last_emit is None or now - self.last_emit >= self.min_interval:
+            self.last_emit = now
+            return True
+        return False
 
 
 class SkydioAPI:
@@ -678,8 +714,10 @@ class SkydioTransferApp:
 
             except requests.exceptions.HTTPError as e:
                 err = e
+                LOGGER.warning("Fetch HTTPError: status=%s", getattr(e.response, "status_code", "?"))
                 self.root.after(0, lambda: self._handle_api_error(err))
             except Exception as e:
+                LOGGER.exception("Fetch failed")
                 msg = str(e)
                 self.root.after(0, lambda: messagebox.showerror("Error", msg))
             finally:
@@ -693,6 +731,7 @@ class SkydioTransferApp:
         self.all_media = media_list
         self._refresh_tree(media_list)
         dates_count = len({m["date"] for m in media_list if m["date"] != "unknown"})
+        LOGGER.info("Fetch complete: %d files across %d dates", len(media_list), dates_count)
         self._set_status(f"Loaded {len(media_list)} media files across {dates_count} dates.")
 
     def _refresh_tree(self, media_list):
@@ -776,8 +815,11 @@ class SkydioTransferApp:
             messagebox.showinfo("No Folder", "Choose an output folder first.")
             return
 
-        # Validate API credentials before queuing
-        if not self.token_entry.get().strip():
+        # Snapshot credentials on the main thread — the download worker
+        # must not touch Tk widgets.
+        api_token = self.token_entry.get().strip()
+        token_id = self.token_id_entry.get().strip()
+        if not api_token:
             messagebox.showerror("Error", "Please enter your API Token.")
             return
 
@@ -797,6 +839,8 @@ class SkydioTransferApp:
                 if item["status"] in ("Queued", "Downloading")
             }
 
+        use_subfolders = self.use_date_subfolders.get()
+
         for uid in selected_ids:
             media = media_by_uuid.get(uid)
             if not media:
@@ -805,18 +849,14 @@ class SkydioTransferApp:
                 continue
 
             self._queue_counter += 1
-            use_subfolders = self.use_date_subfolders.get()
-            q_item = {
-                "q_id": str(self._queue_counter),
-                "uuid": media["uuid"],
-                "filename": media["filename"],
-                "date": media["date"],
-                "size": media["size"],
-                "download_url": media.get("download_url", ""),
-                "output_folder": output_folder,
-                "use_date_subfolders": use_subfolders,
-                "status": "Queued",
-            }
+            q_item = build_queue_item(
+                media=media,
+                output_folder=output_folder,
+                use_subfolders=use_subfolders,
+                api_token=api_token,
+                token_id=token_id,
+                q_id=self._queue_counter,
+            )
 
             with self._queue_lock:
                 self.download_queue.append(q_item)
@@ -927,15 +967,13 @@ class SkydioTransferApp:
 
     def _process_queue_item(self, item):
         """Process a single download queue item."""
-        token = self.token_entry.get().strip()
-        token_id = self.token_id_entry.get().strip()
-        if not token:
+        if not item.get("api_token"):
             item["status"] = "Failed"
             self._update_queue_item_status(item["q_id"], "Failed")
             self._set_status_safe("No API token — skipping.")
             return
 
-        api = SkydioAPI(token, token_id)
+        api = api_from_item(item)
         dest_path = self._resolve_dest_path(item)
 
         # Skip if already exists with matching size
@@ -979,8 +1017,12 @@ class SkydioTransferApp:
                 _fn = item["filename"]
                 _attempt = attempt
                 _max = max_retries
+                throttle = ProgressThrottle(min_interval=0.25)
 
-                def file_progress(downloaded, total, fn=_fn, att=_attempt, mx=_max):
+                def file_progress(downloaded, total, fn=_fn, att=_attempt, mx=_max, th=throttle):
+                    is_final = bool(total) and downloaded >= total
+                    if not is_final and not th.tick(time.monotonic()):
+                        return
                     pct = downloaded / total * 100 if total else 0
                     retry_s = f" (attempt {att}/{mx})" if att > 1 else ""
                     self._set_status_safe(f"Downloading {fn}{retry_s} — {pct:.0f}%")
@@ -1008,6 +1050,10 @@ class SkydioTransferApp:
 
             except Exception as e:
                 self._cleanup_partial(dest_path)
+                LOGGER.warning(
+                    "Download attempt %d/%d failed for %s: %s",
+                    attempt, max_retries, item["filename"], e,
+                )
                 if attempt < max_retries:
                     wait = attempt * 5
                     self._set_status_safe(
@@ -1016,6 +1062,7 @@ class SkydioTransferApp:
                     self._update_queue_item_status(item["q_id"], f"Waiting {wait}s...")
                     time.sleep(wait)
                 else:
+                    LOGGER.error("Download failed permanently: %s", item["filename"])
                     item["status"] = "Failed"
                     self._update_queue_item_status(item["q_id"], "Failed")
                     self._set_status_safe(f"Failed: {item['filename']} — {e} (all {max_retries} attempts)")
@@ -1041,7 +1088,51 @@ class SkydioTransferApp:
 # Entry Point
 # ──────────────────────────────────────────────
 
+def log_dir():
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "SkydioTransfer"
+
+
+def setup_logging():
+    if LOGGER.handlers:
+        return
+    LOGGER.setLevel(logging.INFO)
+    directory = log_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    handler = logging.handlers.RotatingFileHandler(
+        directory / "app.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(threadName)s %(message)s"
+    ))
+    LOGGER.addHandler(handler)
+
+    def _main_excepthook(exc_type, exc_value, tb):
+        LOGGER.critical("Uncaught exception", exc_info=(exc_type, exc_value, tb))
+        sys.__excepthook__(exc_type, exc_value, tb)
+
+    def _thread_excepthook(args):
+        LOGGER.critical(
+            "Uncaught exception in thread %s",
+            args.thread.name if args.thread else "?",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _main_excepthook
+    threading.excepthook = _thread_excepthook
+
+
 def main():
+    setup_logging()
+    LOGGER.info("Starting Skydio Media Transfer")
+
     # Set DPI awareness for sharp text on Windows (must be before Tk() creation)
     try:
         from ctypes import windll
