@@ -108,12 +108,58 @@ def migrate_legacy_config():
 BASE_URL = "https://api.skydio.com/api/v0"
 FONT_FAMILY = "Segoe UI"
 DATE_PLACEHOLDER = "All dates"
-MAX_LISTING_PAGES = 1000
+
+# HTTP listing (fetch media index)
+LISTING_PAGE_SIZE = 500
+LISTING_TIMEOUT_S = 180
 LISTING_MAX_RETRIES = 3
+MAX_LISTING_PAGES = 1000
+
+# HTTP download (fetch individual file)
+DOWNLOAD_CHUNK_BYTES = 64 * 1024
+DOWNLOAD_TIMEOUT_S = 120
+DOWNLOAD_MAX_ATTEMPTS = 3  # initial + (DOWNLOAD_MAX_ATTEMPTS - 1) retries
+
+# UI
+PROGRESS_INTERVAL_S = 0.25
 
 
 class _DownloadCancelled(Exception):
     """Raised when a download is cancelled mid-stream."""
+
+
+_WINDOWS_ILLEGAL_FILENAME_CHARS = '<>:"/\\|?*'
+_WINDOWS_RESERVED_BASENAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+
+
+def sanitize_windows_filename(name, replacement="_"):
+    """Return a filename safe for NTFS: replaces illegal chars, escapes reserved names, trims trailing dots/spaces."""
+    cleaned = "".join(replacement if c in _WINDOWS_ILLEGAL_FILENAME_CHARS else c for c in name)
+    cleaned = cleaned.rstrip(". ")
+    if not cleaned:
+        return "file"
+    stem = cleaned.rpartition(".")[0] or cleaned
+    if stem.upper() in _WINDOWS_RESERVED_BASENAMES:
+        cleaned = "_" + cleaned
+    return cleaned
+
+
+def parse_captured_time(cap_time):
+    """Split a Skydio captured_time string into ('YYYY-MM-DD', 'HH:MM'). Robust to format shifts."""
+    if not cap_time:
+        return "unknown", "—"
+    try:
+        normalized = cap_time.rstrip().rstrip("Z")
+        if "T" in normalized:
+            dt = datetime.fromisoformat(normalized)
+            return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
+        return date_type.fromisoformat(normalized).isoformat(), "—"
+    except (ValueError, TypeError):
+        return "unknown", "—"
 
 
 def extract_legacy_credentials(config_dict):
@@ -271,14 +317,14 @@ class SkydioAPI:
                 )
                 break
 
-            params = {"per_page": 500, "page_number": page}
+            params = {"per_page": LISTING_PAGE_SIZE, "page_number": page}
             if date_from:
                 params["captured_since"] = date_from
             if date_to:
                 params["captured_before"] = date_to
 
             resp = self._get_with_retries(
-                f"{BASE_URL}/media_files", params=params, timeout=180,
+                f"{BASE_URL}/media_files", params=params, timeout=LISTING_TIMEOUT_S,
             )
             data = resp.json().get("data", {})
             files = data.get("files", [])
@@ -301,7 +347,7 @@ class SkydioAPI:
     def download_file(self, download_url, dest_path, progress_callback=None, cancel_check=None):
         """Download a media file using its direct download URL."""
         resp = requests.get(
-            download_url, headers=self._headers(), stream=True, timeout=120
+            download_url, headers=self._headers(), stream=True, timeout=DOWNLOAD_TIMEOUT_S
         )
         resp.raise_for_status()
 
@@ -309,7 +355,7 @@ class SkydioAPI:
         downloaded = 0
 
         with open(dest_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
+            for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
                 if cancel_check and cancel_check():
                     raise _DownloadCancelled()
                 f.write(chunk)
@@ -583,7 +629,7 @@ class SkydioTransferApp:
         self.download_queue = []       # ordered list of queue items
         self._queue_lock = threading.Lock()
         self._queue_pending = queue.Queue()  # signals worker that new items exist
-        self.cancel_requested = False
+        self.cancel_requested = threading.Event()
         self._queue_counter = 0  # unique id for each queue item
 
         self._build_ui()
@@ -818,13 +864,7 @@ class SkydioTransferApp:
     @staticmethod
     def _enrich_media(mf):
         """Convert a raw API media dict into an enriched display dict."""
-        cap_time = mf.get("captured_time", "")
-        if cap_time and len(cap_time) >= 16:
-            m_date, m_time = cap_time[:10], cap_time[11:16]
-        elif cap_time and len(cap_time) >= 10:
-            m_date, m_time = cap_time[:10], "—"
-        else:
-            m_date, m_time = "unknown", "—"
+        m_date, m_time = parse_captured_time(mf.get("captured_time", ""))
 
         return {
             "uuid": mf.get("uuid", ""),
@@ -1059,7 +1099,7 @@ class SkydioTransferApp:
         self.tree.selection_remove(*selected_ids)
 
     def _cancel_download(self):
-        self.cancel_requested = True
+        self.cancel_requested.set()
         self._set_status("Cancelling current download...")
 
     def _retry_failed(self):
@@ -1090,7 +1130,7 @@ class SkydioTransferApp:
 
     def _clear_all_queue(self):
         # Cancel any active download first
-        self.cancel_requested = True
+        self.cancel_requested.set()
         with self._queue_lock:
             to_remove = [item for item in self.download_queue if item["status"] != "Downloading"]
             self.download_queue = [item for item in self.download_queue if item["status"] == "Downloading"]
@@ -1130,7 +1170,7 @@ class SkydioTransferApp:
                     self.root.after(0, lambda: self.progress_bar.configure(value=0))
                     break
 
-                self.cancel_requested = False
+                self.cancel_requested.clear()
                 self._update_queue_item_status(item["q_id"], "Downloading")
                 self._process_queue_item(item)
 
@@ -1171,38 +1211,36 @@ class SkydioTransferApp:
         else:
             dest_folder = Path(item["output_folder"])
         dest_folder.mkdir(parents=True, exist_ok=True)
-        return dest_folder / item["filename"]
+        return dest_folder / sanitize_windows_filename(item["filename"])
 
     def _download_with_retries(self, item, api, dest_path):
         """Attempt to download a file with retries."""
-        max_retries = 3
-        cancel_fn = lambda: self.cancel_requested
+        cancel_fn = self.cancel_requested.is_set
 
-        for attempt in range(1, max_retries + 1):
-            if self.cancel_requested:
+        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+            if self.cancel_requested.is_set():
                 item["status"] = "Cancelled"
                 self._update_queue_item_status(item["q_id"], "Cancelled")
                 return
 
-            retry_label = f" (attempt {attempt}/{max_retries})" if attempt > 1 else ""
+            retry_label = f" (attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS})" if attempt > 1 else ""
             self._set_status_safe(f"Downloading {item['filename']}{retry_label}...")
             self._update_queue_item_status(
                 item["q_id"],
-                f"Retry {attempt}/{max_retries}" if attempt > 1 else "Downloading",
+                f"Retry {attempt}/{DOWNLOAD_MAX_ATTEMPTS}" if attempt > 1 else "Downloading",
             )
 
             try:
                 _fn = item["filename"]
                 _attempt = attempt
-                _max = max_retries
-                throttle = ProgressThrottle(min_interval=0.25)
+                throttle = ProgressThrottle(min_interval=PROGRESS_INTERVAL_S)
 
-                def file_progress(downloaded, total, fn=_fn, att=_attempt, mx=_max, th=throttle):
+                def file_progress(downloaded, total, fn=_fn, att=_attempt, th=throttle):
                     is_final = bool(total) and downloaded >= total
                     if not is_final and not th.tick(time.monotonic()):
                         return
                     pct = downloaded / total * 100 if total else 0
-                    retry_s = f" (attempt {att}/{mx})" if att > 1 else ""
+                    retry_s = f" (attempt {att}/{DOWNLOAD_MAX_ATTEMPTS})" if att > 1 else ""
                     self._set_status_safe(f"Downloading {fn}{retry_s} — {pct:.0f}%")
                     self.root.after(0, lambda p=pct: self.progress_bar.configure(value=p))
 
@@ -1228,22 +1266,43 @@ class SkydioTransferApp:
 
             except Exception as e:
                 self._cleanup_partial(dest_path)
+
+                # Delegate backoff + 429 handling to the shared retry_policy.
+                status = None
+                retry_after = None
+                exc_for_policy = e
+                if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+                    status = e.response.status_code
+                    retry_after = e.response.headers.get("Retry-After")
+                    exc_for_policy = None
+
+                should_retry, delay = retry_policy(
+                    exception=exc_for_policy,
+                    status_code=status,
+                    retry_after=retry_after,
+                    attempt=attempt - 1,
+                    max_retries=DOWNLOAD_MAX_ATTEMPTS - 1,
+                )
+
                 LOGGER.warning(
                     "Download attempt %d/%d failed for %s: %s",
-                    attempt, max_retries, item["filename"], e,
+                    attempt, DOWNLOAD_MAX_ATTEMPTS, item["filename"], e,
                 )
-                if attempt < max_retries:
-                    wait = attempt * 5
+
+                if should_retry:
                     self._set_status_safe(
-                        f"Failed {item['filename']} (attempt {attempt}/{max_retries}): {e} — retrying in {wait}s..."
+                        f"Failed {item['filename']} (attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS}): "
+                        f"{e} — retrying in {delay:.0f}s..."
                     )
-                    self._update_queue_item_status(item["q_id"], f"Waiting {wait}s...")
-                    time.sleep(wait)
+                    self._update_queue_item_status(item["q_id"], f"Waiting {delay:.0f}s...")
+                    time.sleep(delay)
                 else:
                     LOGGER.error("Download failed permanently: %s", item["filename"])
                     item["status"] = "Failed"
                     self._update_queue_item_status(item["q_id"], "Failed")
-                    self._set_status_safe(f"Failed: {item['filename']} — {e} (all {max_retries} attempts)")
+                    self._set_status_safe(
+                        f"Failed: {item['filename']} — {e} (all {DOWNLOAD_MAX_ATTEMPTS} attempts)"
+                    )
 
     @staticmethod
     def _cleanup_partial(dest_path):
