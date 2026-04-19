@@ -1326,8 +1326,10 @@ class SkydioTransferApp:
 # ──────────────────────────────────────────────
 
 def log_dir():
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    return Path(base) / "SkydioTransfer"
+    """Log files live next to the executable (or script), same place as config.json."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
 
 def setup_logging():

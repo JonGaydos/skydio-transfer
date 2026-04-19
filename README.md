@@ -70,6 +70,6 @@ This application is not intended for use on government systems or networks.
 
 This application does not collect, transmit, or store any data externally. Your API token is stored in **Windows Credential Manager** (under the `SkydioMediaTransfer` service); other settings live in a local `config.json` file next to the `.exe`. Neither is uploaded anywhere. All communication is directly between your computer and the official Skydio Cloud API.
 
-A rotating log file is written to `%LOCALAPPDATA%\SkydioTransfer\app.log` to help diagnose issues. Log entries never contain your API token.
+A rotating log file (`app.log`) is written next to the `.exe` — same folder as `config.json` — to help diagnose issues. Log entries never contain your API token.
 
 If you previously used a version that stored the token in `config.json`, it will be migrated to Credential Manager on first launch.

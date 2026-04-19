@@ -6,4 +6,6 @@ build/
 *.spec
 *.egg-info/
 config.json
+app.log
+app.log.*
 .env
