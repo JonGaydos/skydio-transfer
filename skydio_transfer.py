@@ -14,7 +14,7 @@ import time
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from datetime import datetime, date as date_type
+from datetime import datetime, date as date_type, time as dtime, timezone
 from pathlib import Path
 
 import requests
@@ -55,10 +55,53 @@ def save_config(data):
 BASE_URL = "https://api.skydio.com/api/v0"
 FONT_FAMILY = "Segoe UI"
 DATE_PLACEHOLDER = "All dates"
+MAX_LISTING_PAGES = 1000
+LISTING_MAX_RETRIES = 3
 
 
 class _DownloadCancelled(Exception):
     """Raised when a download is cancelled mid-stream."""
+
+
+def local_date_to_utc_iso(date_str, *, end_of_day=False, tz=None):
+    """Convert YYYY-MM-DD in a local timezone to a UTC ISO-8601 timestamp with 'Z' suffix.
+
+    `tz=None` means the system's local timezone (production use).
+    Tests inject a fixed tz so results are deterministic across machines.
+    """
+    d = date_type.fromisoformat(date_str)
+    t = dtime(23, 59, 59) if end_of_day else dtime(0, 0, 0)
+    local_dt = datetime.combine(d, t, tzinfo=tz) if tz is not None else datetime.combine(d, t).astimezone()
+    utc_dt = local_dt.astimezone(timezone.utc)
+    return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def retry_policy(exception, status_code, retry_after, attempt, max_retries):
+    """Decide whether to retry an HTTP attempt and how long to wait.
+
+    Pure function — no side effects. Caller sleeps `delay` seconds before retry.
+    """
+    if attempt >= max_retries:
+        return False, 0.0
+
+    backoff = float(min(2 ** attempt, 60))
+
+    if exception is not None:
+        return True, backoff
+
+    if status_code == 429:
+        header_delay = 0.0
+        if retry_after is not None:
+            try:
+                header_delay = float(retry_after)
+            except (TypeError, ValueError):
+                header_delay = 0.0
+        return True, min(max(header_delay, backoff), 60.0)
+
+    if status_code is not None and status_code >= 500:
+        return True, backoff
+
+    return False, 0.0
 
 
 def build_queue_item(media, output_folder, use_subfolders, api_token, token_id, q_id):
@@ -107,6 +150,42 @@ class SkydioAPI:
             h["X-Api-Token-Id"] = self.token_id
         return h
 
+    def _get_with_retries(self, url, params, timeout):
+        """GET with retry_policy. Sleeps between attempts. Raises on terminal failure."""
+        attempt = 0
+        while True:
+            exc = None
+            resp = None
+            try:
+                resp = requests.get(url, headers=self._headers(), params=params, timeout=timeout)
+            except requests.exceptions.RequestException as e:
+                exc = e
+
+            status = resp.status_code if resp is not None else None
+            retry_after = resp.headers.get("Retry-After") if resp is not None else None
+
+            should_retry, delay = retry_policy(
+                exception=exc,
+                status_code=status,
+                retry_after=retry_after,
+                attempt=attempt,
+                max_retries=LISTING_MAX_RETRIES,
+            )
+
+            if should_retry:
+                LOGGER.warning(
+                    "Retrying GET (attempt=%d status=%s exc=%s wait=%.1fs)",
+                    attempt, status, type(exc).__name__ if exc else None, delay,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+
+            if exc is not None:
+                raise exc
+            resp.raise_for_status()
+            return resp
+
     def get_media(self, date_from=None, date_to=None, progress_callback=None):
         """Fetch media files directly, filtered by date range. Handles pagination.
 
@@ -117,16 +196,22 @@ class SkydioAPI:
         page = 1
 
         while True:
+            if page > MAX_LISTING_PAGES:
+                LOGGER.error(
+                    "Listing aborted: exceeded MAX_LISTING_PAGES=%d (server pagination loop?)",
+                    MAX_LISTING_PAGES,
+                )
+                break
+
             params = {"per_page": 500, "page_number": page}
             if date_from:
-                params["captured_since"] = f"{date_from}T00:00:00Z"
+                params["captured_since"] = date_from
             if date_to:
-                params["captured_before"] = f"{date_to}T23:59:59Z"
+                params["captured_before"] = date_to
 
-            resp = requests.get(
-                f"{BASE_URL}/media_files", headers=self._headers(), params=params, timeout=180
+            resp = self._get_with_retries(
+                f"{BASE_URL}/media_files", params=params, timeout=180,
             )
-            resp.raise_for_status()
             data = resp.json().get("data", {})
             files = data.get("files", [])
             pagination = data.get("pagination", {})
@@ -703,9 +788,18 @@ class SkydioTransferApp:
                         f"({files_so_far} files loaded)"
                     )
 
+                # Convert user-entered local dates to UTC ISO-8601 so the
+                # server-side filter matches what the user intended. Without
+                # this, a user in EST asking for "2024-03-15" would miss
+                # the first 5 hours of their local day.
+                captured_since = local_date_to_utc_iso(date_from) if date_from else None
+                captured_before = (
+                    local_date_to_utc_iso(date_to, end_of_day=True) if date_to else None
+                )
+
                 media_files = api.get_media(
-                    date_from=date_from,
-                    date_to=date_to,
+                    date_from=captured_since,
+                    date_to=captured_before,
                     progress_callback=on_page,
                 )
 
