@@ -26,7 +26,7 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --windowed --name SkydioTransfer --icon NONE skydio_transfer.py
+          pyinstaller --onefile --windowed --name SkydioTransfer --icon NONE --collect-submodules keyring skydio_transfer.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -17,9 +17,15 @@ from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, date as date_type, time as dtime, timezone
 from pathlib import Path
 
+import keyring
+import keyring.errors
 import requests
 
 LOGGER = logging.getLogger("skydio_transfer")
+
+KEYRING_SERVICE = "SkydioMediaTransfer"
+KEYRING_TOKEN_USER = "api_token"
+KEYRING_TOKEN_ID_USER = "token_id"
 
 # ──────────────────────────────────────────────
 # Configuration Manager
@@ -48,6 +54,53 @@ def save_config(data):
         json.dump(data, f, indent=2)
 
 
+def load_credentials():
+    """Read (api_token, token_id) from the OS credential store. Empty strings on miss or error."""
+    try:
+        token = keyring.get_password(KEYRING_SERVICE, KEYRING_TOKEN_USER) or ""
+        token_id = keyring.get_password(KEYRING_SERVICE, KEYRING_TOKEN_ID_USER) or ""
+        return token, token_id
+    except keyring.errors.KeyringError:
+        LOGGER.exception("Failed to read credentials from keyring")
+        return "", ""
+
+
+def save_credentials(api_token, token_id):
+    """Write credentials to the OS credential store. Empty values delete the entry."""
+    _set_or_delete(KEYRING_TOKEN_USER, api_token)
+    _set_or_delete(KEYRING_TOKEN_ID_USER, token_id)
+
+
+def _set_or_delete(username, value):
+    if value:
+        keyring.set_password(KEYRING_SERVICE, username, value)
+        return
+    try:
+        keyring.delete_password(KEYRING_SERVICE, username)
+    except keyring.errors.PasswordDeleteError:
+        pass  # nothing stored; that's fine
+
+
+def migrate_legacy_config():
+    """One-time: move api_token/token_id from config.json into the OS credential store.
+
+    Safe to call on every launch — becomes a no-op once the legacy keys are gone.
+    Returns True if a migration actually happened.
+    """
+    cfg = load_config()
+    if not has_legacy_credentials(cfg):
+        return False
+    token, token_id, sanitized = extract_legacy_credentials(cfg)
+    try:
+        save_credentials(token, token_id)
+    except keyring.errors.KeyringError:
+        LOGGER.exception("Credential migration failed; leaving config.json as-is")
+        return False
+    save_config(sanitized)
+    LOGGER.info("Migrated credentials from config.json to keyring")
+    return True
+
+
 # ──────────────────────────────────────────────
 # Skydio API Client
 # ──────────────────────────────────────────────
@@ -61,6 +114,21 @@ LISTING_MAX_RETRIES = 3
 
 class _DownloadCancelled(Exception):
     """Raised when a download is cancelled mid-stream."""
+
+
+def extract_legacy_credentials(config_dict):
+    """Split a legacy config dict into (api_token, token_id, sanitized_config).
+
+    Pure: does not mutate the input. Non-string / None values become "".
+    """
+    sanitized = {k: v for k, v in config_dict.items() if k not in ("api_token", "token_id")}
+    api_token = config_dict.get("api_token") or ""
+    token_id = config_dict.get("token_id") or ""
+    return api_token, token_id, sanitized
+
+
+def has_legacy_credentials(config_dict):
+    return bool(config_dict.get("api_token") or config_dict.get("token_id"))
 
 
 def local_date_to_utc_iso(date_str, *, end_of_day=False, tz=None):
@@ -692,19 +760,35 @@ class SkydioTransferApp:
     # ── Config Persistence ──
 
     def _load_saved_config(self):
+        migrate_legacy_config()
         cfg = load_config()
-        if cfg.get("api_token"):
-            self.token_entry.insert(0, cfg["api_token"])
-        if cfg.get("token_id"):
-            self.token_id_entry.insert(0, cfg["token_id"])
+        token, token_id = load_credentials()
+        if token:
+            self.token_entry.insert(0, token)
+        if token_id:
+            self.token_id_entry.insert(0, token_id)
         if cfg.get("output_folder"):
             self.output_entry.insert(0, cfg["output_folder"])
 
     def _save_credentials(self):
+        api_token = self.token_entry.get().strip()
+        token_id = self.token_id_entry.get().strip()
+        output_folder = self.output_entry.get().strip()
+        try:
+            save_credentials(api_token, token_id)
+        except keyring.errors.KeyringError as e:
+            LOGGER.exception("Failed to save credentials to keyring")
+            messagebox.showerror(
+                "Error",
+                "Could not save credentials to Windows Credential Manager.\n\n"
+                f"{e}",
+            )
+            return
         cfg = load_config()
-        cfg["api_token"] = self.token_entry.get().strip()
-        cfg["token_id"] = self.token_id_entry.get().strip()
-        cfg["output_folder"] = self.output_entry.get().strip()
+        cfg["output_folder"] = output_folder
+        # Strip any stale legacy secrets that might still be on disk.
+        cfg.pop("api_token", None)
+        cfg.pop("token_id", None)
         save_config(cfg)
         self._set_status("Settings saved.")
 
