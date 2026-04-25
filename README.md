@@ -52,11 +52,13 @@ You can download media directly into a SharePoint document library by using a lo
 Requires Python 3.10+:
 
 ```bash
-pip install -r requirements.txt
-pyinstaller --onefile --windowed --name SkydioTransfer skydio_transfer.py
+pip install -r requirements-dev.txt
+pytest                                  # optional: run the test suite
+pyinstaller --onefile --windowed --name SkydioTransfer --icon NONE \
+            --collect-submodules keyring skydio_transfer.py
 ```
 
-The `.exe` will be in the `dist/` folder.
+The `.exe` will be in the `dist/` folder. `--collect-submodules keyring` is required so PyInstaller bundles the Windows credential-store backend that `keyring` lazy-imports at runtime.
 
 Alternatively, push to GitHub and the Actions workflow builds it automatically.
 
